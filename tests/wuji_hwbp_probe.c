@@ -7,15 +7,14 @@
 static volatile uint64_t g_sink;
 
 /*
- * The current KPM handler uses break-and-skip semantics for user execute
- * breakpoints: it records the hit and advances PC by one arm64 instruction.
- * Keep the first instruction as a semantic no-op so this probe can continue
- * normally after each breakpoint hit.
+ * The first instruction is semantically meaningful.  A break-and-skip handler
+ * would skip the add and return the original argument.  A real single-step
+ * handler executes the add once, re-enables the breakpoint, then returns v + 1.
  */
-__attribute__((naked, noinline, aligned(4))) static void hwbp_probe_target(void)
+__attribute__((naked, noinline, aligned(4))) static uint64_t hwbp_probe_target(uint64_t v)
 {
     __asm__ __volatile__(
-        "nop\n"
+        "add x0, x0, #1\n"
         "ret\n");
 }
 
@@ -38,8 +37,7 @@ int main(void)
     printf("go\n");
 
     for (i = 0; i < 8; ++i) {
-        hwbp_probe_target();
-        g_sink += (uint64_t)i + 1;
+        g_sink += hwbp_probe_target((uint64_t)i);
         printf("tick=%d sink=%llu\n", i, (unsigned long long)g_sink);
         usleep(200000);
     }

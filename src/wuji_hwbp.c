@@ -6,6 +6,7 @@
 
 #include <common.h>
 #include <compiler.h>
+#include <hook.h>
 #include <kallsyms.h>
 #include <kpmodule.h>
 #include <kputils.h>
@@ -145,15 +146,24 @@ typedef void (*put_task_struct_t)(struct task_struct *task);
 typedef struct task_struct *(*kthread_create_on_node_t)(
     int (*threadfn)(void *data), void *data, int node, const char *namefmt, ...);
 typedef int (*wake_up_process_t)(struct task_struct *tsk);
+typedef void (*user_enable_single_step_t)(struct task_struct *task);
+typedef void (*user_disable_single_step_t)(struct task_struct *task);
+typedef void (*perf_event_disable_inatomic_t)(struct perf_event *event);
+typedef void (*perf_event_enable_t)(struct perf_event *event);
 
 struct hwbp_slot {
     bool used;
+    bool stepping;
     pid_t pid;
     uint64_t addr;
     uint64_t len;
     uint64_t hits;
     uint64_t last_pc;
+    uint64_t step_starts;
+    uint64_t step_completes;
+    uint64_t last_step_pc;
     struct perf_event *event;
+    struct task_struct *step_task;
 };
 
 KPM_NAME("wuji-hwbp");
@@ -172,12 +182,22 @@ static put_pid_t g_put_pid;
 static put_task_struct_t g_put_task_struct;
 static kthread_create_on_node_t g_kthread_create_on_node;
 static wake_up_process_t g_wake_up_process;
+static user_enable_single_step_t g_user_enable_single_step;
+static user_disable_single_step_t g_user_disable_single_step;
+static perf_event_disable_inatomic_t g_perf_event_disable_inatomic;
+static perf_event_enable_t g_perf_event_enable;
+static unsigned long g_single_step_handler_addr;
+static int g_step_hook_installed;
 static struct task_struct *g_worker_task;
 static struct hwbp_slot g_slots[WUJI_HWBP_MAX];
 static uint64_t g_total_hits;
 static uint64_t g_unknown_hits;
 static uint64_t g_last_hit_pc;
 static uint64_t g_last_hit_event;
+static uint64_t g_step_starts;
+static uint64_t g_step_completes;
+static uint64_t g_step_failures;
+static int g_last_step_error;
 static uint64_t g_install_attempts;
 static uint64_t g_install_failures;
 static uint64_t g_uninstall_attempts;
@@ -200,6 +220,15 @@ static const char *g_resolver_name = "none";
 static char g_last_worker_msg[256];
 
 static int wuji_hwbp_worker(void *data);
+static void wuji_single_step_before(hook_fargs3_t *fargs, void *udata);
+
+static inline struct task_struct *wuji_current_task(void)
+{
+    uint64_t sp_el0;
+
+    asm volatile("mrs %0, sp_el0" : "=r"(sp_el0));
+    return (struct task_struct *)(uintptr_t)sp_el0;
+}
 
 static long copy_reply(char *__user out_msg, int outlen, const char *msg)
 {
@@ -361,10 +390,91 @@ static int start_worker(void)
     return 0;
 }
 
+static int resolve_step_symbols(void)
+{
+    if (g_user_enable_single_step && g_user_disable_single_step &&
+        g_perf_event_disable_inatomic && g_perf_event_enable &&
+        g_single_step_handler_addr) {
+        return 0;
+    }
+
+    if (!lookup_symbol("sukisu_compact_find_symbol") && !kallsyms_lookup_name) {
+        g_last_step_error = -ENOSYS;
+        return -ENOSYS;
+    }
+
+    g_user_enable_single_step =
+        (user_enable_single_step_t)lookup_symbol("user_enable_single_step");
+    g_user_disable_single_step =
+        (user_disable_single_step_t)lookup_symbol("user_disable_single_step");
+    g_perf_event_disable_inatomic =
+        (perf_event_disable_inatomic_t)lookup_symbol("perf_event_disable_inatomic");
+    g_perf_event_enable =
+        (perf_event_enable_t)lookup_symbol("perf_event_enable");
+    g_single_step_handler_addr = lookup_symbol("single_step_handler");
+
+    if (!g_user_enable_single_step || !g_user_disable_single_step ||
+        !g_perf_event_disable_inatomic || !g_perf_event_enable ||
+        !g_single_step_handler_addr) {
+        g_last_step_error = -ENOSYS;
+        pr_err("wuji-hwbp: step symbols missing enable=%px disable=%px perf_disable_inatomic=%px perf_enable=%px single_step_handler=0x%llx\n",
+               g_user_enable_single_step, g_user_disable_single_step,
+               g_perf_event_disable_inatomic, g_perf_event_enable,
+               (unsigned long long)g_single_step_handler_addr);
+        return -ENOSYS;
+    }
+
+    g_last_step_error = 0;
+    return 0;
+}
+
+static int ensure_step_hook(void)
+{
+    hook_err_t err;
+    int ret;
+
+    if (g_step_hook_installed) {
+        return 0;
+    }
+
+    ret = resolve_step_symbols();
+    if (ret) {
+        return ret;
+    }
+
+    err = hook_wrap3((void *)g_single_step_handler_addr,
+                     wuji_single_step_before, NULL, NULL);
+    if (err != HOOK_NO_ERR) {
+        g_last_step_error = -(int)err;
+        pr_err("wuji-hwbp: hook single_step_handler failed err=%d addr=0x%llx\n",
+               err, (unsigned long long)g_single_step_handler_addr);
+        return g_last_step_error;
+    }
+
+    g_step_hook_installed = 1;
+    g_last_step_error = 0;
+    pr_info("wuji-hwbp: hooked single_step_handler addr=0x%llx\n",
+            (unsigned long long)g_single_step_handler_addr);
+    return 0;
+}
+
+static void remove_step_hook(void)
+{
+    if (!g_step_hook_installed || !g_single_step_handler_addr) {
+        return;
+    }
+
+    hook_unwrap((void *)g_single_step_handler_addr,
+                wuji_single_step_before, NULL);
+    g_step_hook_installed = 0;
+    pr_info("wuji-hwbp: unhooked single_step_handler\n");
+}
+
 static void wuji_hwbp_handler(struct perf_event *event,
                               struct perf_sample_data *data,
                               struct pt_regs *regs)
 {
+    struct task_struct *task;
     uint64_t pc = 0;
     int i;
 
@@ -377,16 +487,7 @@ static void wuji_hwbp_handler(struct perf_event *event,
     g_total_hits++;
     g_last_hit_pc = pc;
     g_last_hit_event = (uint64_t)(uintptr_t)event;
-
-    /*
-     * A user execute breakpoint traps before the instruction executes.  If we
-     * return with the same PC, this probe can livelock on the same instruction.
-     * For this first-stage execute breakpoint manager, treat the trap as a
-     * break-and-skip event so the target thread can continue.
-     */
-    if (regs) {
-        regs->pc += HW_BREAKPOINT_LEN_4;
-    }
+    task = wuji_current_task();
 
     for (i = 0; i < WUJI_HWBP_MAX; ++i) {
         if (!g_slots[i].used) {
@@ -400,10 +501,79 @@ static void wuji_hwbp_handler(struct perf_event *event,
 
         g_slots[i].hits++;
         g_slots[i].last_pc = pc;
+        if (!task || !g_user_enable_single_step ||
+            !g_perf_event_disable_inatomic || !g_step_hook_installed) {
+            g_step_failures++;
+            if (event && g_perf_event_disable_inatomic) {
+                g_perf_event_disable_inatomic(event);
+            }
+            pr_err("wuji-hwbp: hit without step support task=%px enable=%px disable_event=%px hook=%d\n",
+                   task, g_user_enable_single_step, g_perf_event_disable_inatomic,
+                   g_step_hook_installed);
+            return;
+        }
+
+        if (g_slots[i].stepping) {
+            g_step_failures++;
+            pr_err("wuji-hwbp: nested hit slot=%d pid=%d pc=0x%llx step_task=%px current=%px\n",
+                   i, g_slots[i].pid, (unsigned long long)pc,
+                   g_slots[i].step_task, task);
+            return;
+        }
+
+        g_slots[i].stepping = true;
+        g_slots[i].step_task = task;
+        g_slots[i].step_starts++;
+        g_step_starts++;
+        g_perf_event_disable_inatomic(event);
+        g_user_enable_single_step(task);
         return;
     }
 
     g_unknown_hits++;
+}
+
+static void wuji_single_step_before(hook_fargs3_t *fargs, void *udata)
+{
+    struct task_struct *task;
+    struct pt_regs *regs;
+    uint64_t pc = 0;
+    int i;
+
+    (void)udata;
+
+    task = wuji_current_task();
+    regs = fargs ? (struct pt_regs *)(uintptr_t)fargs->arg2 : NULL;
+    if (regs) {
+        pc = regs->pc;
+    }
+
+    for (i = 0; i < WUJI_HWBP_MAX; ++i) {
+        if (!g_slots[i].used || !g_slots[i].stepping ||
+            g_slots[i].step_task != task) {
+            continue;
+        }
+
+        if (g_user_disable_single_step) {
+            g_user_disable_single_step(task);
+        }
+
+        if (g_slots[i].event && g_perf_event_enable) {
+            g_perf_event_enable(g_slots[i].event);
+        }
+
+        g_slots[i].stepping = false;
+        g_slots[i].step_task = NULL;
+        g_slots[i].step_completes++;
+        g_slots[i].last_step_pc = pc;
+        g_step_completes++;
+
+        if (fargs) {
+            fargs->ret = 0;
+            fargs->skip_origin = 1;
+        }
+        return;
+    }
 }
 
 static int validate_len(uint64_t len)
@@ -425,6 +595,20 @@ static int find_free_slot(void)
     return -1;
 }
 
+static int count_active_slots(void)
+{
+    int i;
+    int active = 0;
+
+    for (i = 0; i < WUJI_HWBP_MAX; ++i) {
+        if (g_slots[i].used) {
+            active++;
+        }
+    }
+
+    return active;
+}
+
 static long worker_uninstall_slot(int i)
 {
     struct perf_event *event;
@@ -435,6 +619,13 @@ static long worker_uninstall_slot(int i)
     }
 
     event = g_slots[i].event;
+
+    if (g_slots[i].stepping && g_slots[i].step_task &&
+        g_user_disable_single_step) {
+        g_user_disable_single_step(g_slots[i].step_task);
+    }
+    g_slots[i].stepping = false;
+    g_slots[i].step_task = NULL;
 
     if (event && !g_unregister_hw_breakpoint) {
         ret = resolve_symbols();
@@ -482,6 +673,9 @@ static long worker_uninstall_handle(uint64_t handle)
                      "ok: uninstalled handle=0x%llx slot=%d\n",
                      (unsigned long long)handle, i);
             pr_info("wuji-hwbp: %s", g_last_worker_msg);
+            if (count_active_slots() == 0) {
+                remove_step_hook();
+            }
             return 0;
         }
     }
@@ -529,6 +723,9 @@ static long worker_uninstall_all(void)
     snprintf(g_last_worker_msg, sizeof(g_last_worker_msg),
              "ok: cleared slots=%d\n", cleared);
     pr_info("wuji-hwbp: %s", g_last_worker_msg);
+    if (count_active_slots() == 0) {
+        remove_step_hook();
+    }
     return 0;
 }
 
@@ -601,6 +798,19 @@ static long worker_install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t le
         return g_last_worker_error;
     }
 
+    ret = ensure_step_hook();
+    if (ret) {
+        if (task_ref) {
+            g_put_task_struct(task);
+        }
+        g_put_pid(pid_ref);
+        g_install_failures++;
+        g_last_worker_error = ret;
+        snprintf(g_last_worker_msg, sizeof(g_last_worker_msg),
+                 "error: single-step hook unavailable ret=%d\n", ret);
+        return ret;
+    }
+
     memset(&attr, 0, sizeof(attr));
     attr.type = PERF_TYPE_BREAKPOINT;
     attr.size = sizeof(attr);
@@ -626,6 +836,9 @@ static long worker_install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t le
 
     if (IS_ERR(event)) {
         ret = (int)PTR_ERR(event);
+        if (count_active_slots() == 0) {
+            remove_step_hook();
+        }
         g_install_failures++;
         g_last_worker_error = ret;
         snprintf(g_last_worker_msg, sizeof(g_last_worker_msg),
@@ -634,6 +847,9 @@ static long worker_install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t le
         return ret;
     }
     if (!event) {
+        if (count_active_slots() == 0) {
+            remove_step_hook();
+        }
         g_install_failures++;
         g_last_worker_error = -EINVAL;
         snprintf(g_last_worker_msg, sizeof(g_last_worker_msg),
@@ -797,6 +1013,14 @@ static long prepare_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t len,
         return copy_reply(out_msg, outlen, reply);
     }
 
+    ret = resolve_step_symbols();
+    if (ret) {
+        g_prepare_failures++;
+        g_last_prepare_error = ret;
+        snprintf(reply, sizeof(reply), "error: step symbols missing ret=%d\n", ret);
+        return copy_reply(out_msg, outlen, reply);
+    }
+
     pid_ref = g_find_get_pid(pid);
     if (!pid_ref) {
         g_prepare_failures++;
@@ -823,28 +1047,38 @@ static long prepare_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t len,
     }
 
     snprintf(reply, sizeof(reply),
-             "ok: prepare-only pid=%d addr=0x%llx len=%llu symbols=1 install=async-worker\n",
+             "ok: prepare-only pid=%d addr=0x%llx len=%llu symbols=1 step_symbols=1 install=async-worker\n",
              pid, (unsigned long long)addr, (unsigned long long)len);
     return copy_reply(out_msg, outlen, reply);
 }
 
 static long status(char *__user out_msg, int outlen)
 {
-    char reply[1024];
+    char reply[2048];
     int off = 0;
     int i;
     int symbols_ok;
+    int step_symbols_ok;
 
     symbols_ok = g_register_user_hw_breakpoint && g_unregister_hw_breakpoint &&
                  g_find_get_pid && g_put_pid &&
                  ((g_get_pid_task && g_put_task_struct) || g_pid_task) ? 1 : 0;
+    step_symbols_ok = g_user_enable_single_step && g_user_disable_single_step &&
+                      g_perf_event_disable_inatomic && g_perf_event_enable &&
+                      g_single_step_handler_addr ? 1 : 0;
 
     off += snprintf(reply + off, sizeof(reply) - off,
-                    "wuji-hwbp: mode=async-worker slots=%d total_hits=%llu unknown_hits=%llu last_hit_pc=0x%llx last_hit_event=0x%llx install_attempts=%llu install_failures=%llu uninstall_attempts=%llu uninstall_failures=%llu prepare_attempts=%llu prepare_failures=%llu symbols=%d resolver=%s last_resolve=%d last_prepare=%d worker_alive=%d worker_busy=%d pending=%d submit_seq=%llu done_seq=%llu last_worker=%d last_msg=%s\n",
+                    "wuji-hwbp: mode=single-step slots=%d total_hits=%llu unknown_hits=%llu last_hit_pc=0x%llx last_hit_event=0x%llx step_starts=%llu step_completes=%llu step_failures=%llu step_symbols=%d step_hook=%d single_step_handler=0x%llx last_step=%d install_attempts=%llu install_failures=%llu uninstall_attempts=%llu uninstall_failures=%llu prepare_attempts=%llu prepare_failures=%llu symbols=%d resolver=%s last_resolve=%d last_prepare=%d worker_alive=%d worker_busy=%d pending=%d submit_seq=%llu done_seq=%llu last_worker=%d last_msg=%s\n",
                     WUJI_HWBP_MAX, (unsigned long long)g_total_hits,
                     (unsigned long long)g_unknown_hits,
                     (unsigned long long)g_last_hit_pc,
                     (unsigned long long)g_last_hit_event,
+                    (unsigned long long)g_step_starts,
+                    (unsigned long long)g_step_completes,
+                    (unsigned long long)g_step_failures,
+                    step_symbols_ok, g_step_hook_installed,
+                    (unsigned long long)g_single_step_handler_addr,
+                    g_last_step_error,
                     (unsigned long long)g_install_attempts,
                     (unsigned long long)g_install_failures,
                     (unsigned long long)g_uninstall_attempts,
@@ -870,12 +1104,16 @@ static long status(char *__user out_msg, int outlen)
         }
 
         off += snprintf(reply + off, sizeof(reply) - off,
-                        "slot=%d handle=0x%llx pid=%d addr=0x%llx len=%llu hits=%llu last_pc=0x%llx\n",
+                        "slot=%d handle=0x%llx pid=%d addr=0x%llx len=%llu hits=%llu last_pc=0x%llx stepping=%d step_starts=%llu step_completes=%llu last_step_pc=0x%llx\n",
                         i, (unsigned long long)(uintptr_t)g_slots[i].event,
                         g_slots[i].pid, (unsigned long long)g_slots[i].addr,
                         (unsigned long long)g_slots[i].len,
                         (unsigned long long)g_slots[i].hits,
-                        (unsigned long long)g_slots[i].last_pc);
+                        (unsigned long long)g_slots[i].last_pc,
+                        g_slots[i].stepping ? 1 : 0,
+                        (unsigned long long)g_slots[i].step_starts,
+                        (unsigned long long)g_slots[i].step_completes,
+                        (unsigned long long)g_slots[i].last_step_pc);
         if (off < 0) {
             off = 0;
         } else if (off >= (int)sizeof(reply)) {
@@ -899,6 +1137,12 @@ static long wuji_hwbp_init(const char *args, const char *event, void *__user res
     g_unknown_hits = 0;
     g_last_hit_pc = 0;
     g_last_hit_event = 0;
+    g_step_starts = 0;
+    g_step_completes = 0;
+    g_step_failures = 0;
+    g_last_step_error = 0;
+    g_step_hook_installed = 0;
+    g_single_step_handler_addr = 0;
     g_install_attempts = 0;
     g_install_failures = 0;
     g_uninstall_attempts = 0;
@@ -944,6 +1188,7 @@ static long wuji_hwbp_control(const char *args, char *__user out_msg, int outlen
 
     if (!strcmp(args, "status")) {
         (void)resolve_symbols();
+        (void)resolve_step_symbols();
         return status(out_msg, outlen);
     }
 
@@ -1002,6 +1247,7 @@ static long wuji_hwbp_exit(void *__user reserved)
         return -EBUSY;
     }
 
+    remove_step_hook();
     pr_info("wuji-hwbp: unloaded idle\n");
     return 0;
 }

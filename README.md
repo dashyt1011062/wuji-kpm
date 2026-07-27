@@ -9,6 +9,7 @@ This version is a SukiSU-compatible hardware breakpoint probe:
 - queue hardware-breakpoint install/uninstall/clear work onto a short-lived kernel worker
 - avoid calling perf hardware-breakpoint APIs directly from KPM `ctl0`
 - count execute-breakpoint hits in the overflow handler with `sample_period=1`
+- handle execute breakpoints with real user single-step/re-enable semantics
 - report status through KPM `ctl0`
 
 It is not ABI-compatible with `wuji-kernel` yet. Existing binaries that speak the old `/proc/<key>/<key>` + `struct ioctl_request` protocol still need a compatibility layer.
@@ -21,7 +22,15 @@ This build therefore queues `install`, `uninstall`, and `clear` onto a one-shot 
 
 Do not unload this KPM while a worker is busy or while any breakpoint slot is active. Run `clear`, wait until `status` shows `worker_busy=0`, `pending=0`, and no active slots, then unload if needed. The current SukiSU/KPatch unload path frees KPM text even if `exit` returns `-EBUSY`, so an unsafe unload cannot be reliably prevented inside the KPM.
 
-Current hit handling is intentionally simple: execute breakpoints are handled as break-and-skip events. The handler records the hit and advances user PC by one arm64 instruction (`pc += 4`). Only place breakpoints on an instruction that is safe to skip, such as a deliberately inserted `nop`. Full debugger-style single-step/re-enable semantics are not implemented yet.
+Execute breakpoint hit handling uses a single-step/re-enable flow instead of `pc += 4`:
+
+1. the perf overflow handler records the hit
+2. the matched hardware breakpoint event is disabled with `perf_event_disable_inatomic()`
+3. user single-step is enabled for the current task with `user_enable_single_step()`
+4. a KPatch hook on `single_step_handler()` catches the next single-step exception
+5. the hook disables user single-step, re-enables the original breakpoint with `perf_event_enable()`, then skips the kernel's original `single_step_handler()` return path so the target process does not receive an unwanted SIGTRAP
+
+This means the trapped instruction is executed once and the breakpoint is armed again for the next execution.
 
 ## Build
 
@@ -58,7 +67,7 @@ SukiSU's `ksud kpm control` currently prints only the integer return code. Use `
 
 ## Local probe used for validation
 
-`tests/wuji_hwbp_probe.c` contains a tiny Android user-mode probe. Its target function starts with `nop; ret`, so the KPM's break-and-skip handler can skip the `nop` without corrupting program state.
+`tests/wuji_hwbp_probe.c` contains a tiny Android user-mode probe. Its target function starts with `add x0, x0, #1; ret`, so successful output proves the trapped instruction executed. A break-and-skip implementation would skip the `add` and produce the wrong accumulated value.
 
 Example device-side compile command used in this environment:
 
@@ -71,5 +80,5 @@ Example device-side compile command used in this environment:
 Observed successful validation on the current device:
 
 - `install` registered slot 0 successfully through the async worker
-- after triggering the probe, `status` reported `total_hits=8`, `unknown_hits=0`
-- the probe printed `tick=0` through `tick=7` normally
+- after triggering the probe, `status` reported `total_hits=8`, `unknown_hits=0`, `step_starts=8`, `step_completes=8`, `step_failures=0`
+- the probe printed `tick=0` through `tick=7`; final `sink=36`, proving the trapped `add` executed each time
