@@ -114,6 +114,28 @@ struct vm_area_struct;
 
 typedef unsigned int wuji_poll_t;
 
+struct task_struct_offset {
+    int16_t pid_offset;
+    int16_t tgid_offset;
+    int16_t thread_pid_offset;
+    int16_t ptracer_cred_offset;
+    int16_t real_cred_offset;
+    int16_t cred_offset;
+    int16_t comm_offset;
+    int16_t fs_offset;
+    int16_t files_offset;
+    int16_t loginuid_offset;
+    int16_t sessionid_offset;
+    int16_t seccomp_offset;
+    int16_t security_offset;
+    int16_t stack_offset;
+    int16_t tasks_offset;
+    int16_t mm_offset;
+    int16_t active_mm_offset;
+};
+
+extern struct task_struct_offset task_struct_offset;
+
 struct wuji_proc_ops {
     unsigned int proc_flags;
     int (*proc_open)(struct inode *inode, struct file *file);
@@ -306,6 +328,13 @@ struct wuji_hwbp_hit_item_ex {
     uint8_t aux_data[16];
 };
 
+struct wuji_hwbp_hit_aux_capture {
+    uint32_t aux_flags;
+    uint32_t aux_size;
+    uint64_t aux_addr;
+    uint8_t aux_data[16];
+};
+
 struct wuji_hwbp_hit_status {
     uint32_t running;
     uint32_t done;
@@ -373,6 +402,14 @@ struct wuji_hwbp_buff_snapshot_item {
     int32_t y;
     uint32_t valid;
 };
+
+struct wuji_hwbp_hit_state_capture {
+    struct wuji_hwbp_hit_aux_capture aux;
+    struct wuji_hwbp_coord_snapshot_item coord;
+    struct wuji_hwbp_hp_snapshot_item hp;
+    struct wuji_hwbp_skill_snapshot_item skill;
+    struct wuji_hwbp_buff_snapshot_item buff;
+};
 #pragma pack(pop)
 
 struct hwbp_slot {
@@ -392,6 +429,7 @@ struct hwbp_slot {
     uint32_t hit_head;
     uint32_t hit_count;
     struct wuji_hwbp_hit_item hit_ring[WUJI_HIT_RING_MAX];
+    struct wuji_hwbp_hit_state_capture capture_ring[WUJI_HIT_RING_MAX];
     struct perf_event *event;
     struct task_struct *step_task;
 };
@@ -469,11 +507,21 @@ static char g_last_worker_msg[256];
 
 static int wuji_hwbp_worker(void *data);
 static void wuji_single_step_before(hook_fargs3_t *fargs, void *udata);
-static void record_slot_hit(struct hwbp_slot *slot, struct pt_regs *regs);
+static void record_slot_hit(struct hwbp_slot *slot, struct pt_regs *regs,
+                            struct task_struct *task);
+static void capture_slot_hit_state(struct hwbp_slot *slot,
+                                   const struct wuji_hwbp_hit_item *hit,
+                                   struct wuji_hwbp_hit_state_capture *capture,
+                                   struct task_struct *task);
 static void copy_hit_item(struct wuji_hwbp_hit_item *dst,
                           const struct wuji_hwbp_hit_item *src);
 static int compat_access_process(pid_t nr, uint64_t addr, void *buf,
                                  size_t size, int write);
+static int wuji_copy_task_user_phys_fast(struct task_struct *task,
+                                         uint64_t addr, void *buf,
+                                         size_t size);
+static int is_wuji_valid_hp_pair(int32_t hp, int32_t maxhp);
+static int is_wuji_plausible_skill_raw(int32_t raw);
 static ssize_t wuji_compat_proc_read(struct file *file, char __user *buf,
                                      size_t count, loff_t *ppos);
 
@@ -760,7 +808,7 @@ static void wuji_hwbp_handler(struct perf_event *event,
 
         g_slots[i].hits++;
         g_slots[i].last_pc = pc;
-        record_slot_hit(&g_slots[i], regs);
+        record_slot_hit(&g_slots[i], regs, task);
 
         if (g_slots[i].type != HW_BREAKPOINT_X) {
             return;
@@ -897,11 +945,13 @@ static void reset_slot_state(int i)
     g_slots[i].hit_seq_base = 0;
     g_slots[i].hit_head = 0;
     g_slots[i].hit_count = 0;
+    memset(g_slots[i].capture_ring, 0, sizeof(g_slots[i].capture_ring));
     g_slots[i].event = NULL;
     g_slots[i].step_task = NULL;
 }
 
-static void record_slot_hit(struct hwbp_slot *slot, struct pt_regs *regs)
+static void record_slot_hit(struct hwbp_slot *slot, struct pt_regs *regs,
+                            struct task_struct *task)
 {
     struct wuji_hwbp_hit_item *item;
     uint32_t pos;
@@ -935,6 +985,8 @@ static void record_slot_hit(struct hwbp_slot *slot, struct pt_regs *regs)
         item->regs_info.pstate = regs->pstate;
     }
 
+    capture_slot_hit_state(slot, item, &slot->capture_ring[pos], task);
+
     if (g_hit_session_running && !g_hit_session_done &&
         g_hit_session_remaining > 0) {
         g_hit_session_remaining--;
@@ -956,25 +1008,143 @@ static int is_wuji_plausible_skill_raw(int32_t raw)
     return raw >= 0 && (int64_t)raw <= 300LL * 8192000LL;
 }
 
-static int wuji_read_target_user(pid_t pid, uint64_t addr, void *out,
-                                 size_t size)
+static void capture_slot_hit_state(struct hwbp_slot *slot,
+                                   const struct wuji_hwbp_hit_item *hit,
+                                   struct wuji_hwbp_hit_state_capture *capture,
+                                   struct task_struct *task)
 {
-    int ret;
+    uint64_t handle;
 
-    if (pid <= 0 || !addr || !out || !size) {
-        return -EINVAL;
+    if (!capture) {
+        return;
+    }
+    memset(capture, 0, sizeof(*capture));
+
+    if (!slot || !hit || !task) {
+        return;
     }
 
-    ret = compat_access_process(pid, addr, out, size, 0);
-    return ret == (int)size ? 0 : (ret < 0 ? ret : -EFAULT);
+    handle = (uint64_t)(uintptr_t)slot->event;
+
+    if ((slot->flags & (WUJI_HIT_FLAG_CAPTURE_X1_U16 |
+                        WUJI_HIT_FLAG_SNAPSHOT_COORD_X1_U16)) &&
+        hit->regs_info.regs[1]) {
+        int32_t coord[3] = {};
+
+        if (!wuji_copy_task_user_phys_fast(task, hit->regs_info.regs[1],
+                                           coord, sizeof(coord))) {
+            capture->aux.aux_flags = WUJI_HIT_AUX_X1_U16;
+            capture->aux.aux_size = sizeof(coord);
+            capture->aux.aux_addr = hit->regs_info.regs[1];
+            memcpy(capture->aux.aux_data, coord, sizeof(coord));
+
+            if (slot->flags & WUJI_HIT_FLAG_SNAPSHOT_COORD_X1_U16) {
+                capture->coord.handle = handle;
+                capture->coord.task_id = hit->task_id;
+                capture->coord.hit_addr = hit->hit_addr;
+                capture->coord.hit_time = hit->hit_time;
+                capture->coord.seq = hit->hit_time;
+                capture->coord.x0 = hit->regs_info.regs[0];
+                capture->coord.x1 = hit->regs_info.regs[1];
+                capture->coord.x8 = hit->regs_info.regs[8];
+                capture->coord.x20 = hit->regs_info.regs[20];
+                capture->coord.x29 = hit->regs_info.regs[29];
+                capture->coord.x30 = hit->regs_info.regs[30];
+                capture->coord.x = coord[0];
+                capture->coord.mid = coord[1];
+                capture->coord.y = coord[2];
+                capture->coord.valid = 1;
+            }
+        }
+    }
+
+    if (slot->flags & WUJI_HIT_FLAG_SNAPSHOT_HP_OBJECT) {
+        uint64_t hp_obj = hit->regs_info.regs[1] ? hit->regs_info.regs[1]
+                                                 : hit->regs_info.regs[19];
+        uint64_t actor = 0;
+        int32_t hp = (int32_t)(uint32_t)hit->regs_info.regs[22];
+        int32_t maxhp = (int32_t)(uint32_t)hit->regs_info.regs[9];
+
+        if (hp_obj && is_wuji_valid_hp_pair(hp, maxhp) &&
+            !wuji_copy_task_user_phys_fast(
+                task, hp_obj + WUJI_GAMECORE_HP_OBJECT_ACTOR_OFFSET,
+                &actor, sizeof(actor)) && actor) {
+            capture->hp.handle = handle;
+            capture->hp.task_id = hit->task_id;
+            capture->hp.hit_addr = hit->hit_addr;
+            capture->hp.hit_time = hit->hit_time;
+            capture->hp.seq = hit->hit_time;
+            capture->hp.hp_obj = hp_obj;
+            capture->hp.actor = actor;
+            capture->hp.hp = hp;
+            capture->hp.maxhp = maxhp;
+            capture->hp.valid = 1;
+        }
+    }
+
+    if (slot->flags & WUJI_HIT_FLAG_SNAPSHOT_SKILL_CD) {
+        uint64_t cd_obj = hit->regs_info.regs[20];
+        int32_t raw = (int32_t)(uint32_t)hit->regs_info.regs[8];
+        int32_t period_raw = 0;
+
+        if (cd_obj &&
+            hit->regs_info.regs[22] ==
+                cd_obj + WUJI_SKILL_COOLDOWN_RAW_OFFSET &&
+            is_wuji_plausible_skill_raw(raw)) {
+            if (wuji_copy_task_user_phys_fast(
+                    task, cd_obj + WUJI_SKILL_COOLDOWN_PERIOD_RAW_OFFSET,
+                    &period_raw, sizeof(period_raw)) ||
+                !is_wuji_plausible_skill_raw(period_raw)) {
+                period_raw = 0;
+            }
+
+            capture->skill.handle = handle;
+            capture->skill.task_id = hit->task_id;
+            capture->skill.hit_addr = hit->hit_addr;
+            capture->skill.hit_time = hit->hit_time;
+            capture->skill.seq = hit->hit_time;
+            capture->skill.cd_obj = cd_obj;
+            capture->skill.actor = 0;
+            capture->skill.raw = raw;
+            capture->skill.period_raw = period_raw;
+            capture->skill.skill_id = 0;
+            capture->skill.slot = 0;
+            capture->skill.valid = 1;
+        }
+    }
+
+    if (slot->flags & WUJI_HIT_FLAG_SNAPSHOT_BUFF_TIMER) {
+        uint64_t timer_object = hit->regs_info.regs[0];
+        int32_t raw_ms = (int32_t)(uint32_t)hit->regs_info.regs[8];
+        int32_t x = 0;
+        int32_t y = 0;
+
+        if (timer_object && raw_ms >= 0 && raw_ms <= 900000 &&
+            !wuji_copy_task_user_phys_fast(
+                task, timer_object + WUJI_BUFF_TIMER_X_OFFSET,
+                &x, sizeof(x)) &&
+            !wuji_copy_task_user_phys_fast(
+                task, timer_object + WUJI_BUFF_TIMER_Y_OFFSET,
+                &y, sizeof(y))) {
+            capture->buff.handle = handle;
+            capture->buff.task_id = hit->task_id;
+            capture->buff.hit_addr = hit->hit_addr;
+            capture->buff.hit_time = hit->hit_time;
+            capture->buff.seq = hit->hit_time;
+            capture->buff.timer_object = timer_object;
+            capture->buff.raw_ms = raw_ms;
+            capture->buff.x = x;
+            capture->buff.y = y;
+            capture->buff.valid = 1;
+        }
+    }
 }
 
 static void fill_hit_extras(struct hwbp_slot *slot,
                             const struct wuji_hwbp_hit_item *src,
+                            const struct wuji_hwbp_hit_state_capture *capture,
                             struct wuji_hwbp_hit_item_ex *out)
 {
-    int32_t coord[3];
-
     memset(out, 0, sizeof(*out));
     if (!slot || !src) {
         return;
@@ -987,20 +1157,16 @@ static void fill_hit_extras(struct hwbp_slot *slot,
         return;
     }
 
-    if (!src->regs_info.regs[1]) {
+    if (!capture || (capture->aux.aux_flags & WUJI_HIT_AUX_X1_U16) == 0 ||
+        capture->aux.aux_size == 0) {
         return;
     }
 
-    memset(coord, 0, sizeof(coord));
-    if (wuji_read_target_user(slot->pid, src->regs_info.regs[1],
-                              coord, sizeof(coord))) {
-        return;
-    }
-
-    out->aux_flags = WUJI_HIT_AUX_X1_U16;
-    out->aux_size = sizeof(coord);
-    out->aux_addr = src->regs_info.regs[1];
-    memcpy(out->aux_data, coord, sizeof(coord));
+    out->aux_flags = capture->aux.aux_flags;
+    out->aux_size = capture->aux.aux_size;
+    out->aux_addr = capture->aux.aux_addr;
+    memcpy(out->aux_data, capture->aux.aux_data,
+           sizeof(out->aux_data));
 }
 
 static void copy_hit_item(struct wuji_hwbp_hit_item *dst,
@@ -1638,6 +1804,162 @@ static size_t wuji_min_size(size_t a, size_t b)
     return a < b ? a : b;
 }
 
+static struct mm_struct *wuji_task_mm_quick(struct task_struct *task)
+{
+    struct mm_struct *mm = NULL;
+
+    if (!task) {
+        return NULL;
+    }
+
+    if (task_struct_offset.mm_offset >= 0) {
+        mm = WUJI_READ_ONCE(
+            *(struct mm_struct **)((uintptr_t)task +
+                                   (uintptr_t)task_struct_offset.mm_offset));
+    }
+    if (!mm && task_struct_offset.active_mm_offset >= 0) {
+        mm = WUJI_READ_ONCE(
+            *(struct mm_struct **)((uintptr_t)task +
+                                   (uintptr_t)task_struct_offset.active_mm_offset));
+    }
+
+    return mm;
+}
+
+static int wuji_user_va_to_phys_linear(uint64_t pgd, uint64_t va,
+                                       uint64_t *out_phys,
+                                       size_t *out_page_left)
+{
+    uint64_t table_va = pgd;
+    uint64_t desc = 0;
+    uint64_t offset_mask;
+    int page_shift = wuji_page_shift_from_tcr();
+    int va_bits = wuji_user_va_bits_from_tcr();
+    int pxd_bits;
+    int page_level;
+    int start_level;
+    int lv;
+
+    if (!pgd || !out_phys || page_shift <= 0 || va_bits <= 0) {
+        return -EINVAL;
+    }
+
+    pxd_bits = page_shift - 3;
+    page_level = (va_bits - 4) / pxd_bits;
+    if (page_level <= 0 || page_level > 4) {
+        return -EINVAL;
+    }
+    start_level = 4 - page_level;
+
+    for (lv = start_level; lv < 4; ++lv) {
+        uint64_t pxd_shift = (uint64_t)pxd_bits * (uint64_t)(4 - lv) + 3ULL;
+        uint64_t pxd_ptrs = 1ULL << pxd_bits;
+        uint64_t pxd_index = (va >> pxd_shift) & (pxd_ptrs - 1ULL);
+        uint64_t *entry;
+        uint64_t type;
+
+        if (!table_va) {
+            return -EFAULT;
+        }
+
+        entry = (uint64_t *)(uintptr_t)table_va;
+        desc = WUJI_READ_ONCE(entry[pxd_index]);
+        type = desc & 0x3ULL;
+
+        if (type == 0x3ULL) {
+            uint64_t next_pa;
+
+            if (lv == 3) {
+                offset_mask = (1ULL << page_shift) - 1ULL;
+                *out_phys = (desc & wuji_addr_mask_for_shift(page_shift)) |
+                            (va & offset_mask);
+                if (out_page_left) {
+                    *out_page_left = (size_t)(offset_mask + 1ULL -
+                                             (va & offset_mask));
+                }
+                return 0;
+            }
+
+            next_pa = desc & wuji_addr_mask_for_shift(page_shift);
+            table_va = phys_to_virt(next_pa);
+            continue;
+        }
+
+        if (type == 0x1ULL && lv < 3) {
+            int block_bits = (3 - lv) * pxd_bits + page_shift;
+            offset_mask = (1ULL << block_bits) - 1ULL;
+            *out_phys = (desc & wuji_addr_mask_for_shift(block_bits)) |
+                        (va & offset_mask);
+            if (out_page_left) {
+                uint64_t page_mask = (1ULL << page_shift) - 1ULL;
+                *out_page_left = (size_t)(page_mask + 1ULL -
+                                         (va & page_mask));
+            }
+            return 0;
+        }
+
+        return -EFAULT;
+    }
+
+    return -EFAULT;
+}
+
+static int wuji_copy_task_user_phys_fast(struct task_struct *task,
+                                         uint64_t addr, void *buf,
+                                         size_t size)
+{
+    struct mm_struct *mm;
+    uint64_t pgd;
+    size_t done = 0;
+
+    if (!task || !addr || !buf || !size) {
+        return -EINVAL;
+    }
+    if (mm_struct_offset.pgd_offset < 0 ||
+        (task_struct_offset.mm_offset < 0 &&
+         task_struct_offset.active_mm_offset < 0)) {
+        return -ENOSYS;
+    }
+
+    mm = wuji_task_mm_quick(task);
+    if (!mm || IS_ERR(mm)) {
+        return -ESRCH;
+    }
+
+    pgd = WUJI_READ_ONCE(*(uint64_t *)((uintptr_t)mm +
+                                      (uintptr_t)mm_struct_offset.pgd_offset));
+    if (!pgd) {
+        return -EFAULT;
+    }
+
+    while (done < size) {
+        uint64_t phys = 0;
+        uint64_t kva;
+        size_t page_left = 0;
+        size_t chunk;
+        int ret;
+
+        ret = wuji_user_va_to_phys_linear(pgd, addr + done, &phys,
+                                          &page_left);
+        if (ret) {
+            return ret;
+        }
+        if (!page_left) {
+            return -EFAULT;
+        }
+
+        chunk = wuji_min_size(size - done, page_left);
+        kva = phys_to_virt(phys);
+        if (!kva) {
+            return -EFAULT;
+        }
+        memcpy((char *)buf + done, (void *)(uintptr_t)kva, chunk);
+        done += chunk;
+    }
+
+    return 0;
+}
+
 static int wuji_user_va_to_phys(uint64_t pgd, uint64_t va, uint64_t *out_phys,
                                 size_t *out_page_left)
 {
@@ -1910,7 +2232,8 @@ static ssize_t compat_copy_hit_detail(uint64_t handle, char __user *out,
         uint32_t pos = (slot->hit_head + i) % WUJI_HIT_RING_MAX;
         if (extended) {
             struct wuji_hwbp_hit_item_ex ex_item;
-            fill_hit_extras(slot, &slot->hit_ring[pos], &ex_item);
+            fill_hit_extras(slot, &slot->hit_ring[pos],
+                            &slot->capture_ring[pos], &ex_item);
             if (compat_copy_payload_to_user(out + i * item_size, &ex_item,
                                             sizeof(ex_item))) {
                 return -EFAULT;
@@ -1937,167 +2260,65 @@ static ssize_t compat_copy_hit_detail(uint64_t handle, char __user *out,
 
 static int fill_coord_snapshot(struct hwbp_slot *slot,
                                const struct wuji_hwbp_hit_item *hit,
+                               const struct wuji_hwbp_hit_state_capture *capture,
                                struct wuji_hwbp_coord_snapshot_item *out)
 {
-    int32_t coord[3];
-
     memset(out, 0, sizeof(*out));
     if (!slot || !hit ||
         (slot->flags & WUJI_HIT_FLAG_SNAPSHOT_COORD_X1_U16) == 0 ||
-        !hit->regs_info.regs[1]) {
+        !capture || capture->coord.valid == 0) {
         return 0;
     }
 
-    memset(coord, 0, sizeof(coord));
-    if (wuji_read_target_user(slot->pid, hit->regs_info.regs[1],
-                              coord, sizeof(coord))) {
-        return 0;
-    }
-
-    out->handle = (uint64_t)(uintptr_t)slot->event;
-    out->task_id = hit->task_id;
-    out->hit_addr = hit->hit_addr;
-    out->hit_time = hit->hit_time;
-    out->seq = hit->hit_time;
-    out->x0 = hit->regs_info.regs[0];
-    out->x1 = hit->regs_info.regs[1];
-    out->x8 = hit->regs_info.regs[8];
-    out->x20 = hit->regs_info.regs[20];
-    out->x29 = hit->regs_info.regs[29];
-    out->x30 = hit->regs_info.regs[30];
-    out->x = coord[0];
-    out->mid = coord[1];
-    out->y = coord[2];
-    out->valid = 1;
+    memcpy(out, &capture->coord, sizeof(*out));
     return 1;
 }
 
 static int fill_hp_snapshot(struct hwbp_slot *slot,
                             const struct wuji_hwbp_hit_item *hit,
+                            const struct wuji_hwbp_hit_state_capture *capture,
                             struct wuji_hwbp_hp_snapshot_item *out)
 {
-    uint64_t hp_obj;
-    uint64_t actor = 0;
-    int32_t hp;
-    int32_t maxhp;
-
     memset(out, 0, sizeof(*out));
     if (!slot || !hit ||
-        (slot->flags & WUJI_HIT_FLAG_SNAPSHOT_HP_OBJECT) == 0) {
+        (slot->flags & WUJI_HIT_FLAG_SNAPSHOT_HP_OBJECT) == 0 ||
+        !capture || capture->hp.valid == 0) {
         return 0;
     }
 
-    hp_obj = hit->regs_info.regs[1] ? hit->regs_info.regs[1]
-                                    : hit->regs_info.regs[19];
-    hp = (int32_t)(uint32_t)hit->regs_info.regs[22];
-    maxhp = (int32_t)(uint32_t)hit->regs_info.regs[9];
-    if (!hp_obj || !is_wuji_valid_hp_pair(hp, maxhp)) {
-        return 0;
-    }
-
-    if (wuji_read_target_user(slot->pid,
-                              hp_obj + WUJI_GAMECORE_HP_OBJECT_ACTOR_OFFSET,
-                              &actor, sizeof(actor)) || !actor) {
-        return 0;
-    }
-
-    out->handle = (uint64_t)(uintptr_t)slot->event;
-    out->task_id = hit->task_id;
-    out->hit_addr = hit->hit_addr;
-    out->hit_time = hit->hit_time;
-    out->seq = hit->hit_time;
-    out->hp_obj = hp_obj;
-    out->actor = actor;
-    out->hp = hp;
-    out->maxhp = maxhp;
-    out->valid = 1;
+    memcpy(out, &capture->hp, sizeof(*out));
     return 1;
 }
 
 static int fill_skill_snapshot(struct hwbp_slot *slot,
                                const struct wuji_hwbp_hit_item *hit,
+                               const struct wuji_hwbp_hit_state_capture *capture,
                                struct wuji_hwbp_skill_snapshot_item *out)
 {
-    uint64_t cd_obj;
-    int32_t raw;
-    int32_t period_raw = 0;
-
     memset(out, 0, sizeof(*out));
     if (!slot || !hit ||
-        (slot->flags & WUJI_HIT_FLAG_SNAPSHOT_SKILL_CD) == 0) {
+        (slot->flags & WUJI_HIT_FLAG_SNAPSHOT_SKILL_CD) == 0 ||
+        !capture || capture->skill.valid == 0) {
         return 0;
     }
 
-    cd_obj = hit->regs_info.regs[20];
-    raw = (int32_t)(uint32_t)hit->regs_info.regs[8];
-    if (!cd_obj || hit->regs_info.regs[22] !=
-        cd_obj + WUJI_SKILL_COOLDOWN_RAW_OFFSET ||
-        !is_wuji_plausible_skill_raw(raw)) {
-        return 0;
-    }
-
-    (void)wuji_read_target_user(slot->pid,
-                                cd_obj + WUJI_SKILL_COOLDOWN_PERIOD_RAW_OFFSET,
-                                &period_raw, sizeof(period_raw));
-    if (!is_wuji_plausible_skill_raw(period_raw)) {
-        period_raw = 0;
-    }
-
-    out->handle = (uint64_t)(uintptr_t)slot->event;
-    out->task_id = hit->task_id;
-    out->hit_addr = hit->hit_addr;
-    out->hit_time = hit->hit_time;
-    out->seq = hit->hit_time;
-    out->cd_obj = cd_obj;
-    out->actor = 0;
-    out->raw = raw;
-    out->period_raw = period_raw;
-    out->skill_id = 0;
-    out->slot = 0;
-    out->valid = 1;
+    memcpy(out, &capture->skill, sizeof(*out));
     return 1;
 }
 
 static int fill_buff_snapshot(struct hwbp_slot *slot,
                               const struct wuji_hwbp_hit_item *hit,
+                              const struct wuji_hwbp_hit_state_capture *capture,
                               struct wuji_hwbp_buff_snapshot_item *out)
 {
-    uint64_t timer_object;
-    int32_t raw_ms;
-    int32_t x = 0;
-    int32_t y = 0;
-
     memset(out, 0, sizeof(*out));
     if (!slot || !hit ||
-        (slot->flags & WUJI_HIT_FLAG_SNAPSHOT_BUFF_TIMER) == 0) {
+        (slot->flags & WUJI_HIT_FLAG_SNAPSHOT_BUFF_TIMER) == 0 ||
+        !capture || capture->buff.valid == 0) {
         return 0;
     }
 
-    timer_object = hit->regs_info.regs[0];
-    raw_ms = (int32_t)(uint32_t)hit->regs_info.regs[8];
-    if (!timer_object || raw_ms < 0 || raw_ms > 900000) {
-        return 0;
-    }
-
-    if (wuji_read_target_user(slot->pid,
-                              timer_object + WUJI_BUFF_TIMER_X_OFFSET,
-                              &x, sizeof(x)) ||
-        wuji_read_target_user(slot->pid,
-                              timer_object + WUJI_BUFF_TIMER_Y_OFFSET,
-                              &y, sizeof(y))) {
-        return 0;
-    }
-
-    out->handle = (uint64_t)(uintptr_t)slot->event;
-    out->task_id = hit->task_id;
-    out->hit_addr = hit->hit_addr;
-    out->hit_time = hit->hit_time;
-    out->seq = hit->hit_time;
-    out->timer_object = timer_object;
-    out->raw_ms = raw_ms;
-    out->x = x;
-    out->y = y;
-    out->valid = 1;
+    memcpy(out, &capture->buff, sizeof(*out));
     return 1;
 }
 
@@ -2155,6 +2376,8 @@ static ssize_t compat_copy_state_snapshot(uint64_t type, uint64_t handle,
         for (j = 0; j < slot->hit_count && copied < max_items; ++j) {
             uint32_t pos = (slot->hit_head + j) % WUJI_HIT_RING_MAX;
             struct wuji_hwbp_hit_item *hit = &slot->hit_ring[pos];
+            struct wuji_hwbp_hit_state_capture *capture =
+                &slot->capture_ring[pos];
             char item_buf[sizeof(struct wuji_hwbp_coord_snapshot_item)];
             int valid = 0;
 
@@ -2162,22 +2385,22 @@ static ssize_t compat_copy_state_snapshot(uint64_t type, uint64_t handle,
             switch (type) {
             case WUJI_SNAPSHOT_TYPE_COORD:
                 valid = fill_coord_snapshot(
-                    slot, hit,
+                    slot, hit, capture,
                     (struct wuji_hwbp_coord_snapshot_item *)item_buf);
                 break;
             case WUJI_SNAPSHOT_TYPE_HP:
                 valid = fill_hp_snapshot(
-                    slot, hit,
+                    slot, hit, capture,
                     (struct wuji_hwbp_hp_snapshot_item *)item_buf);
                 break;
             case WUJI_SNAPSHOT_TYPE_SKILL:
                 valid = fill_skill_snapshot(
-                    slot, hit,
+                    slot, hit, capture,
                     (struct wuji_hwbp_skill_snapshot_item *)item_buf);
                 break;
             case WUJI_SNAPSHOT_TYPE_BUFF:
                 valid = fill_buff_snapshot(
-                    slot, hit,
+                    slot, hit, capture,
                     (struct wuji_hwbp_buff_snapshot_item *)item_buf);
                 break;
             default:
@@ -2544,6 +2767,7 @@ static long status(char *__user out_msg, int outlen)
     int symbols_ok;
     int step_symbols_ok;
     int phys_symbols_ok;
+    int hit_capture_ok;
     int phys_page_shift;
     int phys_va_bits;
 
@@ -2558,9 +2782,14 @@ static long status(char *__user out_msg, int outlen)
                       mm_struct_offset.pgd_offset >= 0 ? 1 : 0;
     phys_page_shift = wuji_page_shift_from_tcr();
     phys_va_bits = wuji_user_va_bits_from_tcr();
+    hit_capture_ok = mm_struct_offset.pgd_offset >= 0 &&
+                     (task_struct_offset.mm_offset >= 0 ||
+                      task_struct_offset.active_mm_offset >= 0) &&
+                     phys_page_shift > 0 && phys_va_bits > 0 ? 1 : 0;
 
     off += snprintf(reply + off, sizeof(reply) - off,
-                    "wuji-hwbp: mode=single-step+wuji-proc+phys-mem slots=%d total_hits=%llu unknown_hits=%llu last_hit_pc=0x%llx last_hit_event=0x%llx hit_session=%u/%u remaining=%llu proc=%d step_starts=%llu step_completes=%llu step_failures=%llu step_symbols=%d step_hook=%d single_step_handler=0x%llx phys_symbols=%d page_shift=%d va_bits=%d mm_pgd_off=%d last_step=%d install_attempts=%llu install_failures=%llu uninstall_attempts=%llu uninstall_failures=%llu prepare_attempts=%llu prepare_failures=%llu symbols=%d resolver=%s last_resolve=%d last_prepare=%d worker_alive=%d worker_busy=%d pending=%d submit_seq=%llu done_seq=%llu last_worker=%d last_msg=%s\n",
+                    "wuji-hwbp: mode=single-step+wuji-proc+phys-mem hit_capture=linear-phys:%d slots=%d total_hits=%llu unknown_hits=%llu last_hit_pc=0x%llx last_hit_event=0x%llx hit_session=%u/%u remaining=%llu proc=%d step_starts=%llu step_completes=%llu step_failures=%llu step_symbols=%d step_hook=%d single_step_handler=0x%llx phys_symbols=%d page_shift=%d va_bits=%d task_mm_off=%d task_active_mm_off=%d mm_pgd_off=%d last_step=%d install_attempts=%llu install_failures=%llu uninstall_attempts=%llu uninstall_failures=%llu prepare_attempts=%llu prepare_failures=%llu symbols=%d resolver=%s last_resolve=%d last_prepare=%d worker_alive=%d worker_busy=%d pending=%d submit_seq=%llu done_seq=%llu last_worker=%d last_msg=%s\n",
+                    hit_capture_ok,
                     WUJI_HWBP_MAX, (unsigned long long)g_total_hits,
                     (unsigned long long)g_unknown_hits,
                     (unsigned long long)g_last_hit_pc,
@@ -2574,6 +2803,8 @@ static long status(char *__user out_msg, int outlen)
                     step_symbols_ok, g_step_hook_installed,
                     (unsigned long long)g_single_step_handler_addr,
                     phys_symbols_ok, phys_page_shift, phys_va_bits,
+                    task_struct_offset.mm_offset,
+                    task_struct_offset.active_mm_offset,
                     mm_struct_offset.pgd_offset,
                     g_last_step_error,
                     (unsigned long long)g_install_attempts,
