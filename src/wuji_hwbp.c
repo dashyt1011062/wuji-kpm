@@ -106,6 +106,18 @@ struct perf_event_attr {
         uint64_t probe_offset;
         uint64_t config2;
     };
+    uint64_t branch_sample_type;
+    uint64_t sample_regs_user;
+    uint32_t sample_stack_user;
+    int32_t clockid;
+    uint64_t sample_regs_intr;
+    uint32_t aux_watermark;
+    uint16_t sample_max_stack;
+    uint16_t __reserved_2;
+    uint32_t aux_sample_size;
+    uint32_t __reserved_3;
+    uint64_t sig_data;
+    uint64_t config3;
 };
 
 typedef void (*perf_overflow_handler_t)(struct perf_event *event,
@@ -156,6 +168,10 @@ static const char *g_resolver_name = "none";
 static long copy_reply(char *__user out_msg, int outlen, const char *msg)
 {
     int len;
+
+    if (msg && *msg) {
+        pr_info("wuji-hwbp: %s", msg);
+    }
 
     if (!out_msg || outlen <= 0) {
         return 0;
@@ -419,7 +435,6 @@ static long install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t len,
              "ok: slot=%d handle=0x%llx pid=%d addr=0x%llx len=%llu\n",
              slot, (unsigned long long)(uintptr_t)event, pid,
              (unsigned long long)addr, (unsigned long long)len);
-    pr_info("wuji-hwbp: %s", reply);
     return copy_reply(out_msg, outlen, reply);
 }
 
@@ -453,7 +468,6 @@ static long status(char *__user out_msg, int outlen)
                         (unsigned long long)g_slots[i].last_pc);
     }
 
-    pr_info("wuji-hwbp: status: %s", reply);
     return copy_reply(out_msg, outlen, reply);
 }
 
