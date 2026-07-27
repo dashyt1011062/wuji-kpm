@@ -114,28 +114,6 @@ struct vm_area_struct;
 
 typedef unsigned int wuji_poll_t;
 
-struct task_struct_offset {
-    int16_t pid_offset;
-    int16_t tgid_offset;
-    int16_t thread_pid_offset;
-    int16_t ptracer_cred_offset;
-    int16_t real_cred_offset;
-    int16_t cred_offset;
-    int16_t comm_offset;
-    int16_t fs_offset;
-    int16_t files_offset;
-    int16_t loginuid_offset;
-    int16_t sessionid_offset;
-    int16_t seccomp_offset;
-    int16_t security_offset;
-    int16_t stack_offset;
-    int16_t tasks_offset;
-    int16_t mm_offset;
-    int16_t active_mm_offset;
-};
-
-extern struct task_struct_offset task_struct_offset;
-
 struct wuji_proc_ops {
     unsigned int proc_flags;
     int (*proc_open)(struct inode *inode, struct file *file);
@@ -520,6 +498,7 @@ static int compat_access_process(pid_t nr, uint64_t addr, void *buf,
 static int wuji_copy_task_user_phys_fast(struct task_struct *task,
                                          uint64_t addr, void *buf,
                                          size_t size);
+static int resolve_compat_uaccess_symbols(void);
 static int is_wuji_valid_hp_pair(int32_t hp, int32_t maxhp);
 static int is_wuji_plausible_skill_raw(int32_t raw);
 static ssize_t wuji_compat_proc_read(struct file *file, char __user *buf,
@@ -1384,6 +1363,25 @@ static long worker_install_breakpoint(pid_t pid, uint64_t addr, uint64_t len,
         return g_last_worker_error;
     }
 
+    if (flags & (WUJI_HIT_FLAG_CAPTURE_X1_U16 |
+                 WUJI_HIT_FLAG_SNAPSHOT_COORD_X1_U16 |
+                 WUJI_HIT_FLAG_SNAPSHOT_HP_OBJECT |
+                 WUJI_HIT_FLAG_SNAPSHOT_SKILL_CD |
+                 WUJI_HIT_FLAG_SNAPSHOT_BUFF_TIMER)) {
+        ret = resolve_compat_uaccess_symbols();
+        if (ret) {
+            if (task_ref) {
+                g_put_task_struct(task);
+            }
+            g_put_pid(pid_ref);
+            g_install_failures++;
+            g_last_worker_error = ret;
+            snprintf(g_last_worker_msg, sizeof(g_last_worker_msg),
+                     "error: uaccess symbols missing ret=%d\n", ret);
+            return ret;
+        }
+    }
+
     if (type == HW_BREAKPOINT_X) {
         ret = ensure_step_hook();
         if (ret) {
@@ -1804,160 +1802,28 @@ static size_t wuji_min_size(size_t a, size_t b)
     return a < b ? a : b;
 }
 
-static struct mm_struct *wuji_task_mm_quick(struct task_struct *task)
-{
-    struct mm_struct *mm = NULL;
-
-    if (!task) {
-        return NULL;
-    }
-
-    if (task_struct_offset.mm_offset >= 0) {
-        mm = WUJI_READ_ONCE(
-            *(struct mm_struct **)((uintptr_t)task +
-                                   (uintptr_t)task_struct_offset.mm_offset));
-    }
-    if (!mm && task_struct_offset.active_mm_offset >= 0) {
-        mm = WUJI_READ_ONCE(
-            *(struct mm_struct **)((uintptr_t)task +
-                                   (uintptr_t)task_struct_offset.active_mm_offset));
-    }
-
-    return mm;
-}
-
-static int wuji_user_va_to_phys_linear(uint64_t pgd, uint64_t va,
-                                       uint64_t *out_phys,
-                                       size_t *out_page_left)
-{
-    uint64_t table_va = pgd;
-    uint64_t desc = 0;
-    uint64_t offset_mask;
-    int page_shift = wuji_page_shift_from_tcr();
-    int va_bits = wuji_user_va_bits_from_tcr();
-    int pxd_bits;
-    int page_level;
-    int start_level;
-    int lv;
-
-    if (!pgd || !out_phys || page_shift <= 0 || va_bits <= 0) {
-        return -EINVAL;
-    }
-
-    pxd_bits = page_shift - 3;
-    page_level = (va_bits - 4) / pxd_bits;
-    if (page_level <= 0 || page_level > 4) {
-        return -EINVAL;
-    }
-    start_level = 4 - page_level;
-
-    for (lv = start_level; lv < 4; ++lv) {
-        uint64_t pxd_shift = (uint64_t)pxd_bits * (uint64_t)(4 - lv) + 3ULL;
-        uint64_t pxd_ptrs = 1ULL << pxd_bits;
-        uint64_t pxd_index = (va >> pxd_shift) & (pxd_ptrs - 1ULL);
-        uint64_t *entry;
-        uint64_t type;
-
-        if (!table_va) {
-            return -EFAULT;
-        }
-
-        entry = (uint64_t *)(uintptr_t)table_va;
-        desc = WUJI_READ_ONCE(entry[pxd_index]);
-        type = desc & 0x3ULL;
-
-        if (type == 0x3ULL) {
-            uint64_t next_pa;
-
-            if (lv == 3) {
-                offset_mask = (1ULL << page_shift) - 1ULL;
-                *out_phys = (desc & wuji_addr_mask_for_shift(page_shift)) |
-                            (va & offset_mask);
-                if (out_page_left) {
-                    *out_page_left = (size_t)(offset_mask + 1ULL -
-                                             (va & offset_mask));
-                }
-                return 0;
-            }
-
-            next_pa = desc & wuji_addr_mask_for_shift(page_shift);
-            table_va = phys_to_virt(next_pa);
-            continue;
-        }
-
-        if (type == 0x1ULL && lv < 3) {
-            int block_bits = (3 - lv) * pxd_bits + page_shift;
-            offset_mask = (1ULL << block_bits) - 1ULL;
-            *out_phys = (desc & wuji_addr_mask_for_shift(block_bits)) |
-                        (va & offset_mask);
-            if (out_page_left) {
-                uint64_t page_mask = (1ULL << page_shift) - 1ULL;
-                *out_page_left = (size_t)(page_mask + 1ULL -
-                                         (va & page_mask));
-            }
-            return 0;
-        }
-
-        return -EFAULT;
-    }
-
-    return -EFAULT;
-}
-
 static int wuji_copy_task_user_phys_fast(struct task_struct *task,
                                          uint64_t addr, void *buf,
                                          size_t size)
 {
-    struct mm_struct *mm;
-    uint64_t pgd;
-    size_t done = 0;
+    (void)task;
 
-    if (!task || !addr || !buf || !size) {
+    if (!addr || !buf || !size) {
         return -EINVAL;
     }
-    if (mm_struct_offset.pgd_offset < 0 ||
-        (task_struct_offset.mm_offset < 0 &&
-         task_struct_offset.active_mm_offset < 0)) {
+    /*
+     * Hit-time capture runs in the target thread context.  Keep this path
+     * loader-safe and lightweight: symbols are resolved before installing a
+     * snapshot breakpoint, and the handler only copies the small in-register
+     * user packet.  The public READ/WRITE commands still use the physical
+     * VA->PA + memremap path below.
+     */
+    if (!g_copy_from_user) {
         return -ENOSYS;
     }
 
-    mm = wuji_task_mm_quick(task);
-    if (!mm || IS_ERR(mm)) {
-        return -ESRCH;
-    }
-
-    pgd = WUJI_READ_ONCE(*(uint64_t *)((uintptr_t)mm +
-                                      (uintptr_t)mm_struct_offset.pgd_offset));
-    if (!pgd) {
-        return -EFAULT;
-    }
-
-    while (done < size) {
-        uint64_t phys = 0;
-        uint64_t kva;
-        size_t page_left = 0;
-        size_t chunk;
-        int ret;
-
-        ret = wuji_user_va_to_phys_linear(pgd, addr + done, &phys,
-                                          &page_left);
-        if (ret) {
-            return ret;
-        }
-        if (!page_left) {
-            return -EFAULT;
-        }
-
-        chunk = wuji_min_size(size - done, page_left);
-        kva = phys_to_virt(phys);
-        if (!kva) {
-            return -EFAULT;
-        }
-        memcpy((char *)buf + done, (void *)(uintptr_t)kva, chunk);
-        done += chunk;
-    }
-
-    return 0;
+    return g_copy_from_user(buf, (const void __user *)(uintptr_t)addr,
+                            (unsigned long)size) ? -EFAULT : 0;
 }
 
 static int wuji_user_va_to_phys(uint64_t pgd, uint64_t va, uint64_t *out_phys,
@@ -2782,13 +2648,10 @@ static long status(char *__user out_msg, int outlen)
                       mm_struct_offset.pgd_offset >= 0 ? 1 : 0;
     phys_page_shift = wuji_page_shift_from_tcr();
     phys_va_bits = wuji_user_va_bits_from_tcr();
-    hit_capture_ok = mm_struct_offset.pgd_offset >= 0 &&
-                     (task_struct_offset.mm_offset >= 0 ||
-                      task_struct_offset.active_mm_offset >= 0) &&
-                     phys_page_shift > 0 && phys_va_bits > 0 ? 1 : 0;
+    hit_capture_ok = g_copy_from_user ? 1 : 0;
 
     off += snprintf(reply + off, sizeof(reply) - off,
-                    "wuji-hwbp: mode=single-step+wuji-proc+phys-mem hit_capture=linear-phys:%d slots=%d total_hits=%llu unknown_hits=%llu last_hit_pc=0x%llx last_hit_event=0x%llx hit_session=%u/%u remaining=%llu proc=%d step_starts=%llu step_completes=%llu step_failures=%llu step_symbols=%d step_hook=%d single_step_handler=0x%llx phys_symbols=%d page_shift=%d va_bits=%d task_mm_off=%d task_active_mm_off=%d mm_pgd_off=%d last_step=%d install_attempts=%llu install_failures=%llu uninstall_attempts=%llu uninstall_failures=%llu prepare_attempts=%llu prepare_failures=%llu symbols=%d resolver=%s last_resolve=%d last_prepare=%d worker_alive=%d worker_busy=%d pending=%d submit_seq=%llu done_seq=%llu last_worker=%d last_msg=%s\n",
+                    "wuji-hwbp: mode=single-step+wuji-proc+phys-mem hit_capture=uaccess:%d slots=%d total_hits=%llu unknown_hits=%llu last_hit_pc=0x%llx last_hit_event=0x%llx hit_session=%u/%u remaining=%llu proc=%d step_starts=%llu step_completes=%llu step_failures=%llu step_symbols=%d step_hook=%d single_step_handler=0x%llx phys_symbols=%d page_shift=%d va_bits=%d mm_pgd_off=%d last_step=%d install_attempts=%llu install_failures=%llu uninstall_attempts=%llu uninstall_failures=%llu prepare_attempts=%llu prepare_failures=%llu symbols=%d resolver=%s last_resolve=%d last_prepare=%d worker_alive=%d worker_busy=%d pending=%d submit_seq=%llu done_seq=%llu last_worker=%d last_msg=%s\n",
                     hit_capture_ok,
                     WUJI_HWBP_MAX, (unsigned long long)g_total_hits,
                     (unsigned long long)g_unknown_hits,
@@ -2803,8 +2666,6 @@ static long status(char *__user out_msg, int outlen)
                     step_symbols_ok, g_step_hook_installed,
                     (unsigned long long)g_single_step_handler_addr,
                     phys_symbols_ok, phys_page_shift, phys_va_bits,
-                    task_struct_offset.mm_offset,
-                    task_struct_offset.active_mm_offset,
                     mm_struct_offset.pgd_offset,
                     g_last_step_error,
                     (unsigned long long)g_install_attempts,
