@@ -10,9 +10,16 @@ This version is a SukiSU-compatible hardware breakpoint probe:
 - avoid calling perf hardware-breakpoint APIs directly from KPM `ctl0`
 - count execute-breakpoint hits in the overflow handler with `sample_period=1`
 - handle execute breakpoints with real user single-step/re-enable semantics
+- expose a WuJi-compatible `/proc/<key>/<key>` binary request node for existing user programs
 - report status through KPM `ctl0`
 
-It is not ABI-compatible with `wuji-kernel` yet. Existing binaries that speak the old `/proc/<key>/<key>` + `struct ioctl_request` protocol still need a compatibility layer.
+It now includes a first-pass compatibility layer for binaries that speak the old `/proc/<key>/<key>` + `struct ioctl_request` protocol. The compatibility node is:
+
+```text
+/proc/9c7e1a3b5d0f2c8e4a6b1d9f3e7c0a2b/9c7e1a3b5d0f2c8e4a6b1d9f3e7c0a2b
+```
+
+Implemented compatibility commands include open/close process, read/write process memory through `access_process_vm()`, read user instruction, install/uninstall execute or watchpoint hardware breakpoints, hit count/detail/detail-ex, clear hit ring, and basic hit-session status. State snapshot commands currently return zero items; the AYCPU side reads `/proc/<pid>/maps` directly instead of asking the KPM to build a maps list.
 
 ## Safety note
 
@@ -82,3 +89,4 @@ Observed successful validation on the current device:
 - `install` registered slot 0 successfully through the async worker
 - after triggering the probe, `status` reported `total_hits=8`, `unknown_hits=0`, `step_starts=8`, `step_completes=8`, `step_failures=0`
 - the probe printed `tick=0` through `tick=7`; final `sink=36`, proving the trapped `add` executed each time
+- the WuJi-compatible proc protocol was also validated with read/write self memory, read user instruction, synchronous install/uninstall, `hit_count`, and `hit_detail`; the same single-step probe produced `sink=36`

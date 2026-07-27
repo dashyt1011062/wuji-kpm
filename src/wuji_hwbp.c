@@ -17,6 +17,10 @@
 #include <uapi/asm-generic/errno.h>
 
 #define WUJI_HWBP_MAX 8
+#define WUJI_HIT_RING_MAX 64
+#define WUJI_COMPAT_IO_MAX 65536
+
+#define WUJI_PROC_KEY "9c7e1a3b5d0f2c8e4a6b1d9f3e7c0a2b"
 
 #define PERF_TYPE_BREAKPOINT 5
 
@@ -35,14 +39,80 @@
 #define WUJI_REQ_UNINSTALL 2
 #define WUJI_REQ_CLEAR 3
 
+#define WUJI_CMD_INIT_DEVICE_INFO 1
+#define WUJI_CMD_GET_PROCESS_MAPS_COUNT 6
+#define WUJI_CMD_GET_PROCESS_MAPS_LIST 7
+#define WUJI_CMD_HWBP_OPEN_PROCESS 0x40
+#define WUJI_CMD_HWBP_CLOSE_PROCESS 0x41
+#define WUJI_CMD_HWBP_READ_PROCESS_MEM 0x42
+#define WUJI_CMD_HWBP_WRITE_PROCESS_MEM 0x43
+#define WUJI_CMD_HWBP_READ_USER_INSN 0x44
+#define WUJI_CMD_HWBP_GET_NUM_BRPS 0x45
+#define WUJI_CMD_HWBP_GET_NUM_WRPS 0x46
+#define WUJI_CMD_HWBP_INST_PROCESS_HWBP 0x47
+#define WUJI_CMD_HWBP_UNINST_PROCESS_HWBP 0x48
+#define WUJI_CMD_HWBP_SUSPEND_PROCESS_HWBP 0x49
+#define WUJI_CMD_HWBP_RESUME_PROCESS_HWBP 0x4a
+#define WUJI_CMD_HWBP_GET_HWBP_HIT_COUNT 0x4b
+#define WUJI_CMD_HWBP_GET_HWBP_HIT_DETAIL 0x4c
+#define WUJI_CMD_HWBP_CLEAR_HWBP_HIT 0x4d
+#define WUJI_CMD_HWBP_SET_TRACE_STEP_COUNT 0x53
+#define WUJI_CMD_HWBP_SET_STEP_SIMULATE 0x54
+#define WUJI_CMD_HWBP_SET_STEP_FILTER 0x55
+#define WUJI_CMD_HWBP_SET_EXEC_BP_RESTORE_MODE 0x56
+#define WUJI_CMD_HWBP_START_STEP_SESSION 0x60
+#define WUJI_CMD_HWBP_GET_STEP_STATUS 0x61
+#define WUJI_CMD_HWBP_START_HIT_SESSION 0x63
+#define WUJI_CMD_HWBP_STOP_HIT_SESSION 0x64
+#define WUJI_CMD_HWBP_GET_HIT_STATUS 0x65
+#define WUJI_CMD_HWBP_GET_HWBP_HIT_DETAIL_EX 0x6b
+#define WUJI_CMD_HWBP_GET_STATE_SNAPSHOT 0x6c
+#define WUJI_CMD_HWBP_CLEAR_STATE_SNAPSHOT 0x6d
+
+#define WUJI_FOLL_WRITE 0x01
+
 #define WUJI_READ_ONCE(x) (*(const volatile typeof(x) *)&(x))
 #define WUJI_WRITE_ONCE(x, val) \
     do { (*(volatile typeof(x) *)&(x)) = (val); } while (0)
+#ifndef UINT64_MAX
+#define UINT64_MAX (~0ULL)
+#endif
 
 struct perf_event;
 struct perf_sample_data;
 struct pid;
 struct task_struct;
+struct proc_dir_entry;
+struct inode;
+struct file;
+struct kiocb;
+struct iov_iter;
+struct poll_table_struct;
+struct vm_area_struct;
+
+typedef unsigned int wuji_poll_t;
+
+struct wuji_proc_ops {
+    unsigned int proc_flags;
+    int (*proc_open)(struct inode *inode, struct file *file);
+    ssize_t (*proc_read)(struct file *file, char __user *buf,
+                         size_t count, loff_t *ppos);
+    ssize_t (*proc_read_iter)(struct kiocb *iocb, struct iov_iter *iter);
+    ssize_t (*proc_write)(struct file *file, const char __user *buf,
+                          size_t count, loff_t *ppos);
+    loff_t (*proc_lseek)(struct file *file, loff_t offset, int whence);
+    int (*proc_release)(struct inode *inode, struct file *file);
+    wuji_poll_t (*proc_poll)(struct file *file, struct poll_table_struct *wait);
+    long (*proc_ioctl)(struct file *file, unsigned int cmd, unsigned long arg);
+    long (*proc_compat_ioctl)(struct file *file, unsigned int cmd,
+                              unsigned long arg);
+    int (*proc_mmap)(struct file *file, struct vm_area_struct *vma);
+    unsigned long (*proc_get_unmapped_area)(struct file *file,
+                                            unsigned long addr,
+                                            unsigned long len,
+                                            unsigned long pgoff,
+                                            unsigned long flags);
+};
 
 struct pt_regs {
     uint64_t regs[31];
@@ -150,6 +220,79 @@ typedef void (*user_enable_single_step_t)(struct task_struct *task);
 typedef void (*user_disable_single_step_t)(struct task_struct *task);
 typedef void (*perf_event_disable_inatomic_t)(struct perf_event *event);
 typedef void (*perf_event_enable_t)(struct perf_event *event);
+typedef unsigned long (*copy_from_user_t)(void *to,
+                                          const void __user *from,
+                                          unsigned long n);
+typedef unsigned long (*copy_to_user_t)(void __user *to,
+                                        const void *from,
+                                        unsigned long n);
+typedef int (*access_process_vm_t)(struct task_struct *tsk,
+                                   unsigned long addr,
+                                   void *buf,
+                                   int len,
+                                   unsigned int gup_flags);
+typedef struct proc_dir_entry *(*proc_mkdir_t)(const char *name,
+                                               struct proc_dir_entry *parent);
+typedef struct proc_dir_entry *(*proc_create_t)(
+    const char *name, umode_t mode, struct proc_dir_entry *parent,
+    const struct wuji_proc_ops *proc_ops);
+typedef void (*proc_remove_t)(struct proc_dir_entry *de);
+
+#pragma pack(push, 1)
+struct wuji_ioctl_request {
+    char cmd;
+    uint64_t param1;
+    uint64_t param2;
+    uint64_t param3;
+    uint64_t buf_size;
+};
+
+struct wuji_hwbp_hit_count {
+    uint64_t hit_total_count;
+    uint64_t hit_item_arr_count;
+};
+
+struct wuji_user_pt_regs {
+    uint64_t regs[31];
+    uint64_t sp;
+    uint64_t pc;
+    uint64_t pstate;
+    uint64_t orig_x0;
+    uint64_t syscallno;
+};
+
+struct wuji_user_fpsimd_state {
+    uint32_t sregs[32];
+    uint32_t fpsr;
+    uint32_t fpcr;
+    uint32_t valid;
+};
+
+struct wuji_hwbp_hit_item {
+    uint64_t task_id;
+    uint64_t hit_addr;
+    uint64_t hit_time;
+    struct wuji_user_pt_regs regs_info;
+    struct wuji_user_fpsimd_state fpsimd_info;
+};
+
+struct wuji_hwbp_hit_item_ex {
+    struct wuji_hwbp_hit_item base;
+    uint32_t aux_flags;
+    uint32_t aux_size;
+    uint64_t aux_addr;
+    uint8_t aux_data[16];
+};
+
+struct wuji_hwbp_hit_status {
+    uint32_t running;
+    uint32_t done;
+    uint32_t stop_reason;
+    uint32_t reserved;
+    uint64_t requested_hits;
+    uint64_t remaining_hits;
+};
+#pragma pack(pop)
 
 struct hwbp_slot {
     bool used;
@@ -157,11 +300,17 @@ struct hwbp_slot {
     pid_t pid;
     uint64_t addr;
     uint64_t len;
+    uint64_t type;
+    uint64_t flags;
     uint64_t hits;
     uint64_t last_pc;
     uint64_t step_starts;
     uint64_t step_completes;
     uint64_t last_step_pc;
+    uint64_t hit_seq_base;
+    uint32_t hit_head;
+    uint32_t hit_count;
+    struct wuji_hwbp_hit_item hit_ring[WUJI_HIT_RING_MAX];
     struct perf_event *event;
     struct task_struct *step_task;
 };
@@ -186,14 +335,29 @@ static user_enable_single_step_t g_user_enable_single_step;
 static user_disable_single_step_t g_user_disable_single_step;
 static perf_event_disable_inatomic_t g_perf_event_disable_inatomic;
 static perf_event_enable_t g_perf_event_enable;
+static copy_from_user_t g_copy_from_user;
+static copy_to_user_t g_copy_to_user;
+static access_process_vm_t g_access_process_vm;
+static proc_mkdir_t g_proc_mkdir;
+static proc_create_t g_proc_create;
+static proc_remove_t g_proc_remove;
 static unsigned long g_single_step_handler_addr;
 static int g_step_hook_installed;
+static struct proc_dir_entry *g_proc_dir;
+static struct proc_dir_entry *g_proc_file;
 static struct task_struct *g_worker_task;
 static struct hwbp_slot g_slots[WUJI_HWBP_MAX];
+static char g_compat_io_buf[WUJI_COMPAT_IO_MAX];
 static uint64_t g_total_hits;
 static uint64_t g_unknown_hits;
 static uint64_t g_last_hit_pc;
 static uint64_t g_last_hit_event;
+static uint64_t g_hit_seq;
+static uint64_t g_hit_session_requested;
+static uint64_t g_hit_session_remaining;
+static uint32_t g_hit_session_running;
+static uint32_t g_hit_session_done;
+static uint32_t g_hit_session_stop_reason;
 static uint64_t g_step_starts;
 static uint64_t g_step_completes;
 static uint64_t g_step_failures;
@@ -221,6 +385,13 @@ static char g_last_worker_msg[256];
 
 static int wuji_hwbp_worker(void *data);
 static void wuji_single_step_before(hook_fargs3_t *fargs, void *udata);
+static void record_slot_hit(struct hwbp_slot *slot, struct pt_regs *regs);
+static ssize_t wuji_compat_proc_read(struct file *file, char __user *buf,
+                                     size_t count, loff_t *ppos);
+
+static const struct wuji_proc_ops g_wuji_proc_ops = {
+    .proc_read = wuji_compat_proc_read,
+};
 
 static inline struct task_struct *wuji_current_task(void)
 {
@@ -501,6 +672,12 @@ static void wuji_hwbp_handler(struct perf_event *event,
 
         g_slots[i].hits++;
         g_slots[i].last_pc = pc;
+        record_slot_hit(&g_slots[i], regs);
+
+        if (g_slots[i].type != HW_BREAKPOINT_X) {
+            return;
+        }
+
         if (!task || !g_user_enable_single_step ||
             !g_perf_event_disable_inatomic || !g_step_hook_installed) {
             g_step_failures++;
@@ -582,6 +759,12 @@ static int validate_len(uint64_t len)
            len == HW_BREAKPOINT_LEN_4 || len == HW_BREAKPOINT_LEN_8;
 }
 
+static int validate_type(uint64_t type)
+{
+    return type == HW_BREAKPOINT_X || type == HW_BREAKPOINT_W ||
+           type == HW_BREAKPOINT_RW || type == HW_BREAKPOINT_R;
+}
+
 static int find_free_slot(void)
 {
     int i;
@@ -607,6 +790,95 @@ static int count_active_slots(void)
     }
 
     return active;
+}
+
+static void reset_slot_state(int i)
+{
+    g_slots[i].used = false;
+    g_slots[i].stepping = false;
+    g_slots[i].pid = 0;
+    g_slots[i].addr = 0;
+    g_slots[i].len = 0;
+    g_slots[i].type = 0;
+    g_slots[i].flags = 0;
+    g_slots[i].hits = 0;
+    g_slots[i].last_pc = 0;
+    g_slots[i].step_starts = 0;
+    g_slots[i].step_completes = 0;
+    g_slots[i].last_step_pc = 0;
+    g_slots[i].hit_seq_base = 0;
+    g_slots[i].hit_head = 0;
+    g_slots[i].hit_count = 0;
+    g_slots[i].event = NULL;
+    g_slots[i].step_task = NULL;
+}
+
+static void record_slot_hit(struct hwbp_slot *slot, struct pt_regs *regs)
+{
+    struct wuji_hwbp_hit_item *item;
+    uint32_t pos;
+    int i;
+
+    if (!slot) {
+        return;
+    }
+
+    if (slot->hit_count < WUJI_HIT_RING_MAX) {
+        pos = (slot->hit_head + slot->hit_count) % WUJI_HIT_RING_MAX;
+        slot->hit_count++;
+    } else {
+        pos = slot->hit_head;
+        slot->hit_head = (slot->hit_head + 1) % WUJI_HIT_RING_MAX;
+    }
+
+    item = &slot->hit_ring[pos];
+    memset(item, 0, sizeof(*item));
+    item->task_id = (uint64_t)slot->pid;
+    item->hit_addr = slot->addr;
+    item->hit_time = ++g_hit_seq;
+    slot->hit_seq_base = item->hit_time;
+
+    if (regs) {
+        for (i = 0; i < 31; ++i) {
+            item->regs_info.regs[i] = regs->regs[i];
+        }
+        item->regs_info.sp = regs->sp;
+        item->regs_info.pc = regs->pc;
+        item->regs_info.pstate = regs->pstate;
+    }
+
+    if (g_hit_session_running && !g_hit_session_done &&
+        g_hit_session_remaining > 0) {
+        g_hit_session_remaining--;
+        if (g_hit_session_remaining == 0) {
+            g_hit_session_done = 1;
+            g_hit_session_stop_reason = 1;
+        }
+    }
+}
+
+static void copy_hit_item(struct wuji_hwbp_hit_item *dst,
+                          const struct wuji_hwbp_hit_item *src)
+{
+    int i;
+
+    dst->task_id = src->task_id;
+    dst->hit_addr = src->hit_addr;
+    dst->hit_time = src->hit_time;
+    for (i = 0; i < 31; ++i) {
+        dst->regs_info.regs[i] = src->regs_info.regs[i];
+    }
+    dst->regs_info.sp = src->regs_info.sp;
+    dst->regs_info.pc = src->regs_info.pc;
+    dst->regs_info.pstate = src->regs_info.pstate;
+    dst->regs_info.orig_x0 = src->regs_info.orig_x0;
+    dst->regs_info.syscallno = src->regs_info.syscallno;
+    for (i = 0; i < 32; ++i) {
+        dst->fpsimd_info.sregs[i] = src->fpsimd_info.sregs[i];
+    }
+    dst->fpsimd_info.fpsr = src->fpsimd_info.fpsr;
+    dst->fpsimd_info.fpcr = src->fpsimd_info.fpcr;
+    dst->fpsimd_info.valid = src->fpsimd_info.valid;
 }
 
 static long worker_uninstall_slot(int i)
@@ -638,7 +910,7 @@ static long worker_uninstall_slot(int i)
         g_unregister_hw_breakpoint(event);
     }
 
-    memset(&g_slots[i], 0, sizeof(g_slots[i]));
+    reset_slot_state(i);
     return 0;
 }
 
@@ -729,7 +1001,9 @@ static long worker_uninstall_all(void)
     return 0;
 }
 
-static long worker_install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t len)
+static long worker_install_breakpoint(pid_t pid, uint64_t addr, uint64_t len,
+                                      uint64_t type, uint64_t flags,
+                                      uint64_t *out_handle)
 {
     struct perf_event_attr attr;
     struct perf_event *event;
@@ -748,11 +1022,11 @@ static long worker_install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t le
                  "error: invalid pid/address\n");
         return g_last_worker_error;
     }
-    if (!validate_len(len)) {
+    if (!validate_len(len) || !validate_type(type)) {
         g_install_failures++;
         g_last_worker_error = -EINVAL;
         snprintf(g_last_worker_msg, sizeof(g_last_worker_msg),
-                 "error: invalid breakpoint length\n");
+                 "error: invalid breakpoint length/type\n");
         return g_last_worker_error;
     }
 
@@ -798,24 +1072,26 @@ static long worker_install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t le
         return g_last_worker_error;
     }
 
-    ret = ensure_step_hook();
-    if (ret) {
-        if (task_ref) {
-            g_put_task_struct(task);
+    if (type == HW_BREAKPOINT_X) {
+        ret = ensure_step_hook();
+        if (ret) {
+            if (task_ref) {
+                g_put_task_struct(task);
+            }
+            g_put_pid(pid_ref);
+            g_install_failures++;
+            g_last_worker_error = ret;
+            snprintf(g_last_worker_msg, sizeof(g_last_worker_msg),
+                     "error: single-step hook unavailable ret=%d\n", ret);
+            return ret;
         }
-        g_put_pid(pid_ref);
-        g_install_failures++;
-        g_last_worker_error = ret;
-        snprintf(g_last_worker_msg, sizeof(g_last_worker_msg),
-                 "error: single-step hook unavailable ret=%d\n", ret);
-        return ret;
     }
 
     memset(&attr, 0, sizeof(attr));
     attr.type = PERF_TYPE_BREAKPOINT;
     attr.size = sizeof(attr);
     attr.sample_period = 1;
-    attr.bp_type = HW_BREAKPOINT_X;
+    attr.bp_type = (uint32_t)type;
     attr.bp_addr = addr;
     attr.bp_len = len;
     attr.disabled = 0;
@@ -824,8 +1100,9 @@ static long worker_install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t le
     attr.exclude_hv = 1;
 
     snprintf(g_last_worker_msg, sizeof(g_last_worker_msg),
-             "worker: registering pid=%d addr=0x%llx len=%llu\n",
-             pid, (unsigned long long)addr, (unsigned long long)len);
+             "worker: registering pid=%d addr=0x%llx len=%llu type=%llu\n",
+             pid, (unsigned long long)addr, (unsigned long long)len,
+             (unsigned long long)type);
     pr_info("wuji-hwbp: %s", g_last_worker_msg);
 
     event = g_register_user_hw_breakpoint(&attr, wuji_hwbp_handler, NULL, task);
@@ -857,20 +1134,32 @@ static long worker_install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t le
         return g_last_worker_error;
     }
 
+    reset_slot_state(slot);
     g_slots[slot].used = true;
     g_slots[slot].pid = pid;
     g_slots[slot].addr = addr;
     g_slots[slot].len = len;
+    g_slots[slot].type = type;
+    g_slots[slot].flags = flags;
     g_slots[slot].hits = 0;
     g_slots[slot].last_pc = 0;
     g_slots[slot].event = event;
+    if (out_handle) {
+        *out_handle = (uint64_t)(uintptr_t)event;
+    }
 
     snprintf(g_last_worker_msg, sizeof(g_last_worker_msg),
-             "ok: slot=%d handle=0x%llx pid=%d addr=0x%llx len=%llu\n",
+             "ok: slot=%d handle=0x%llx pid=%d addr=0x%llx len=%llu type=%llu\n",
              slot, (unsigned long long)(uintptr_t)event, pid,
-             (unsigned long long)addr, (unsigned long long)len);
+             (unsigned long long)addr, (unsigned long long)len,
+             (unsigned long long)type);
     pr_info("wuji-hwbp: %s", g_last_worker_msg);
     return 0;
+}
+
+static long worker_install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t len)
+{
+    return worker_install_breakpoint(pid, addr, len, HW_BREAKPOINT_X, 0, NULL);
 }
 
 static int wuji_hwbp_worker(void *data)
@@ -982,6 +1271,497 @@ static long install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t len,
                                  out_msg, outlen);
 }
 
+static int resolve_compat_proc_symbols(void)
+{
+    if (g_proc_mkdir && g_proc_create && g_proc_remove) {
+        return 0;
+    }
+
+    if (!lookup_symbol("sukisu_compact_find_symbol") && !kallsyms_lookup_name) {
+        return -ENOSYS;
+    }
+
+    g_proc_mkdir = (proc_mkdir_t)lookup_symbol("proc_mkdir");
+    g_proc_create = (proc_create_t)lookup_symbol("proc_create");
+    g_proc_remove = (proc_remove_t)lookup_symbol("proc_remove");
+
+    if (!g_proc_mkdir || !g_proc_create || !g_proc_remove) {
+        pr_err("wuji-hwbp: proc symbols missing mkdir=%px create=%px remove=%px\n",
+               g_proc_mkdir, g_proc_create, g_proc_remove);
+        return -ENOSYS;
+    }
+
+    return 0;
+}
+
+static int resolve_compat_memory_symbols(void)
+{
+    if (g_copy_from_user && g_copy_to_user && g_access_process_vm) {
+        return 0;
+    }
+
+    if (!lookup_symbol("sukisu_compact_find_symbol") && !kallsyms_lookup_name) {
+        return -ENOSYS;
+    }
+
+    g_copy_from_user = (copy_from_user_t)lookup_symbol("_copy_from_user");
+    if (!g_copy_from_user) {
+        g_copy_from_user = (copy_from_user_t)lookup_symbol("copy_from_user");
+    }
+    g_copy_to_user = (copy_to_user_t)lookup_symbol("_copy_to_user");
+    if (!g_copy_to_user) {
+        g_copy_to_user = (copy_to_user_t)lookup_symbol("copy_to_user");
+    }
+    g_access_process_vm =
+        (access_process_vm_t)lookup_symbol("access_process_vm");
+
+    if (!g_copy_from_user || !g_copy_to_user || !g_access_process_vm) {
+        pr_err("wuji-hwbp: compat memory symbols missing copy_from_user=%px copy_to_user=%px access_process_vm=%px\n",
+               g_copy_from_user, g_copy_to_user, g_access_process_vm);
+        return -ENOSYS;
+    }
+
+    return 0;
+}
+
+static int compat_copy_payload_to_user(void __user *to, const void *from,
+                                       size_t size)
+{
+    if (!to || !from) {
+        return -EINVAL;
+    }
+    if (!size) {
+        return 0;
+    }
+    if (!g_copy_to_user && resolve_compat_memory_symbols()) {
+        return -ENOSYS;
+    }
+    return g_copy_to_user(to, from, size) ? -EFAULT : 0;
+}
+
+static int create_compat_proc(void)
+{
+    int ret;
+
+    if (g_proc_file) {
+        return 0;
+    }
+
+    ret = resolve_compat_proc_symbols();
+    if (ret) {
+        return ret;
+    }
+
+    g_proc_dir = g_proc_mkdir(WUJI_PROC_KEY, NULL);
+    if (!g_proc_dir) {
+        pr_err("wuji-hwbp: proc_mkdir failed name=%s\n", WUJI_PROC_KEY);
+        return -ENOMEM;
+    }
+
+    g_proc_file = g_proc_create(WUJI_PROC_KEY, 0666, g_proc_dir,
+                                &g_wuji_proc_ops);
+    if (!g_proc_file) {
+        g_proc_remove(g_proc_dir);
+        g_proc_dir = NULL;
+        pr_err("wuji-hwbp: proc_create failed name=%s/%s\n",
+               WUJI_PROC_KEY, WUJI_PROC_KEY);
+        return -ENOMEM;
+    }
+
+    pr_info("wuji-hwbp: compat proc ready /proc/%s/%s\n",
+            WUJI_PROC_KEY, WUJI_PROC_KEY);
+    return 0;
+}
+
+static void remove_compat_proc(void)
+{
+    if (g_proc_file && g_proc_remove) {
+        g_proc_remove(g_proc_file);
+        g_proc_file = NULL;
+    }
+    if (g_proc_dir && g_proc_remove) {
+        g_proc_remove(g_proc_dir);
+        g_proc_dir = NULL;
+    }
+}
+
+static struct task_struct *get_task_for_pid_ref(pid_t nr, int *task_ref,
+                                                struct pid **pid_ref)
+{
+    struct task_struct *task;
+
+    if (task_ref) {
+        *task_ref = 0;
+    }
+    if (pid_ref) {
+        *pid_ref = NULL;
+    }
+
+    if (resolve_symbols() || nr <= 0) {
+        return NULL;
+    }
+
+    *pid_ref = g_find_get_pid(nr);
+    if (!*pid_ref) {
+        return NULL;
+    }
+
+    if (g_get_pid_task && g_put_task_struct) {
+        task = g_get_pid_task(*pid_ref, 0);
+        if (task_ref) {
+            *task_ref = task ? 1 : 0;
+        }
+    } else {
+        task = g_pid_task(*pid_ref, 0);
+    }
+
+    return task;
+}
+
+static int compat_access_process(pid_t nr, uint64_t addr, void *buf,
+                                 size_t size, int write)
+{
+    struct pid *pid_ref = NULL;
+    struct task_struct *task;
+    int task_ref = 0;
+    int ret;
+
+    if (!addr || !buf || size == 0 || size > WUJI_COMPAT_IO_MAX ||
+        size > 0x7fffffffU) {
+        return -EINVAL;
+    }
+
+    ret = resolve_compat_memory_symbols();
+    if (ret) {
+        return ret;
+    }
+
+    task = get_task_for_pid_ref(nr, &task_ref, &pid_ref);
+    if (!task) {
+        if (pid_ref) {
+            g_put_pid(pid_ref);
+        }
+        return -ESRCH;
+    }
+
+    ret = g_access_process_vm(task, (unsigned long)addr, buf, (int)size,
+                              write ? WUJI_FOLL_WRITE : 0);
+
+    if (task_ref) {
+        g_put_task_struct(task);
+    }
+    if (pid_ref) {
+        g_put_pid(pid_ref);
+    }
+
+    return ret;
+}
+
+static struct hwbp_slot *find_slot_by_handle(uint64_t handle)
+{
+    int i;
+
+    for (i = 0; i < WUJI_HWBP_MAX; ++i) {
+        if (g_slots[i].used &&
+            (uint64_t)(uintptr_t)g_slots[i].event == handle) {
+            return &g_slots[i];
+        }
+    }
+
+    return NULL;
+}
+
+static ssize_t compat_copy_hit_detail(uint64_t handle, char __user *out,
+                                      size_t out_size, int extended)
+{
+    struct hwbp_slot *slot;
+    uint32_t max_items;
+    uint32_t copy_count;
+    uint32_t i;
+    size_t item_size;
+
+    if (!out || out_size == 0 || handle == 0) {
+        return -EINVAL;
+    }
+
+    slot = find_slot_by_handle(handle);
+    if (!slot) {
+        return -ENOENT;
+    }
+
+    item_size = extended ? sizeof(struct wuji_hwbp_hit_item_ex)
+                         : sizeof(struct wuji_hwbp_hit_item);
+    max_items = (uint32_t)(out_size / item_size);
+    if (max_items == 0) {
+        return 0;
+    }
+
+    copy_count = slot->hit_count;
+    if (copy_count > max_items) {
+        copy_count = max_items;
+    }
+
+    for (i = 0; i < copy_count; ++i) {
+        uint32_t pos = (slot->hit_head + i) % WUJI_HIT_RING_MAX;
+        if (extended) {
+            struct wuji_hwbp_hit_item_ex ex_item;
+            memset(&ex_item, 0, sizeof(ex_item));
+            copy_hit_item(&ex_item.base, &slot->hit_ring[pos]);
+            if (compat_copy_payload_to_user(out + i * item_size, &ex_item,
+                                            sizeof(ex_item))) {
+                return -EFAULT;
+            }
+        } else {
+            if (compat_copy_payload_to_user(out + i * item_size,
+                                            &slot->hit_ring[pos],
+                                            sizeof(slot->hit_ring[pos]))) {
+                return -EFAULT;
+            }
+        }
+    }
+
+    if (copy_count >= slot->hit_count) {
+        slot->hit_head = 0;
+        slot->hit_count = 0;
+    } else {
+        slot->hit_head = (slot->hit_head + copy_count) % WUJI_HIT_RING_MAX;
+        slot->hit_count -= copy_count;
+    }
+
+    return (ssize_t)copy_count;
+}
+
+static ssize_t wuji_compat_proc_read(struct file *file, char __user *buf,
+                                     size_t count, loff_t *ppos)
+{
+    struct wuji_ioctl_request req;
+    char __user *payload;
+    size_t payload_size;
+    int ret;
+
+    (void)file;
+    (void)ppos;
+
+    if (!buf || count < sizeof(req)) {
+        return -EINVAL;
+    }
+
+    ret = resolve_compat_memory_symbols();
+    if (ret) {
+        return ret;
+    }
+
+    if (g_copy_from_user(&req, buf, sizeof(req))) {
+        return -EFAULT;
+    }
+
+    payload = buf + sizeof(req);
+    payload_size = req.buf_size;
+    if (payload_size > count - sizeof(req)) {
+        payload_size = count - sizeof(req);
+    }
+
+    switch ((unsigned char)req.cmd) {
+    case WUJI_CMD_INIT_DEVICE_INFO:
+    case WUJI_CMD_HWBP_CLOSE_PROCESS:
+    case WUJI_CMD_HWBP_SUSPEND_PROCESS_HWBP:
+    case WUJI_CMD_HWBP_RESUME_PROCESS_HWBP:
+    case WUJI_CMD_HWBP_SET_TRACE_STEP_COUNT:
+    case WUJI_CMD_HWBP_SET_STEP_SIMULATE:
+    case WUJI_CMD_HWBP_SET_STEP_FILTER:
+    case WUJI_CMD_HWBP_SET_EXEC_BP_RESTORE_MODE:
+    case WUJI_CMD_HWBP_START_STEP_SESSION:
+    case WUJI_CMD_HWBP_CLEAR_STATE_SNAPSHOT:
+        return 0;
+
+    case WUJI_CMD_GET_PROCESS_MAPS_COUNT:
+    case WUJI_CMD_GET_PROCESS_MAPS_LIST:
+        return -ENOSYS;
+
+    case WUJI_CMD_HWBP_OPEN_PROCESS: {
+        uint64_t handle = req.param1;
+        struct pid *pid_ref = NULL;
+        struct task_struct *task;
+        int task_ref = 0;
+
+        task = get_task_for_pid_ref((pid_t)req.param1, &task_ref, &pid_ref);
+        if (!task) {
+            if (pid_ref) {
+                g_put_pid(pid_ref);
+            }
+            return -ESRCH;
+        }
+        if (task_ref) {
+            g_put_task_struct(task);
+        }
+        if (pid_ref) {
+            g_put_pid(pid_ref);
+        }
+        if (payload_size >= sizeof(handle)) {
+            ret = compat_copy_payload_to_user(payload, &handle,
+                                              sizeof(handle));
+            if (ret) {
+                return ret;
+            }
+        }
+        return 0;
+    }
+
+    case WUJI_CMD_HWBP_READ_PROCESS_MEM:
+    case WUJI_CMD_HWBP_READ_USER_INSN: {
+        size_t want = payload_size;
+        int bytes;
+
+        if ((unsigned char)req.cmd == WUJI_CMD_HWBP_READ_USER_INSN) {
+            want = sizeof(uint32_t);
+            if (payload_size < want) {
+                return -EINVAL;
+            }
+        }
+        if (want > WUJI_COMPAT_IO_MAX) {
+            return -EINVAL;
+        }
+
+        bytes = compat_access_process((pid_t)req.param1, req.param2,
+                                      g_compat_io_buf, want, 0);
+        if (bytes <= 0) {
+            return bytes ? bytes : -EFAULT;
+        }
+        ret = compat_copy_payload_to_user(payload, g_compat_io_buf,
+                                          (size_t)bytes);
+        if (ret) {
+            return ret;
+        }
+        return bytes;
+    }
+
+    case WUJI_CMD_HWBP_WRITE_PROCESS_MEM:
+        if (payload_size == 0 || payload_size > WUJI_COMPAT_IO_MAX) {
+            return -EINVAL;
+        }
+        if (g_copy_from_user(g_compat_io_buf, payload, payload_size)) {
+            return -EFAULT;
+        }
+        ret = compat_access_process((pid_t)req.param1, req.param2,
+                                    g_compat_io_buf, payload_size, 1);
+        return ret <= 0 ? (ret ? ret : -EFAULT) : ret;
+
+    case WUJI_CMD_HWBP_GET_NUM_BRPS:
+    case WUJI_CMD_HWBP_GET_NUM_WRPS: {
+        uint64_t num = WUJI_HWBP_MAX;
+        if (payload_size >= sizeof(num)) {
+            ret = compat_copy_payload_to_user(payload, &num, sizeof(num));
+            if (ret) {
+                return ret;
+            }
+        }
+        return sizeof(num);
+    }
+
+    case WUJI_CMD_HWBP_INST_PROCESS_HWBP: {
+        uint64_t handle = 0;
+        uint64_t len = req.param3 & 0xffU;
+        uint64_t type = (req.param3 >> 8) & 0xffU;
+        uint64_t flags = req.param3 & ~0xffffULL;
+
+        ret = worker_install_breakpoint((pid_t)req.param1, req.param2,
+                                        len, type, flags, &handle);
+        if (ret) {
+            return ret;
+        }
+        if (payload_size >= sizeof(handle)) {
+            ret = compat_copy_payload_to_user(payload, &handle,
+                                              sizeof(handle));
+            if (ret) {
+                return ret;
+            }
+        }
+        return 0;
+    }
+
+    case WUJI_CMD_HWBP_UNINST_PROCESS_HWBP:
+        return worker_uninstall_handle(req.param1);
+
+    case WUJI_CMD_HWBP_CLEAR_HWBP_HIT: {
+        struct hwbp_slot *slot = find_slot_by_handle(req.param1);
+        if (!slot) {
+            return -ENOENT;
+        }
+        slot->hit_head = 0;
+        slot->hit_count = 0;
+        return 0;
+    }
+
+    case WUJI_CMD_HWBP_GET_HWBP_HIT_COUNT: {
+        struct hwbp_slot *slot = find_slot_by_handle(req.param1);
+        struct wuji_hwbp_hit_count count_reply;
+
+        if (!slot || payload_size < sizeof(count_reply)) {
+            return !slot ? -ENOENT : -EINVAL;
+        }
+        count_reply.hit_total_count = slot->hits;
+        count_reply.hit_item_arr_count = slot->hit_count;
+        ret = compat_copy_payload_to_user(payload, &count_reply,
+                                          sizeof(count_reply));
+        if (ret) {
+            return ret;
+        }
+        return 0;
+    }
+
+    case WUJI_CMD_HWBP_GET_HWBP_HIT_DETAIL:
+        return compat_copy_hit_detail(req.param1, payload, payload_size, 0);
+
+    case WUJI_CMD_HWBP_GET_HWBP_HIT_DETAIL_EX:
+        return compat_copy_hit_detail(req.param1, payload, payload_size, 1);
+
+    case WUJI_CMD_HWBP_START_HIT_SESSION:
+        g_hit_session_running = 1;
+        g_hit_session_done = 0;
+        g_hit_session_stop_reason = 0;
+        g_hit_session_requested = req.param1 ? req.param1 : UINT64_MAX;
+        g_hit_session_remaining = g_hit_session_requested;
+        return 0;
+
+    case WUJI_CMD_HWBP_STOP_HIT_SESSION:
+        g_hit_session_running = 0;
+        g_hit_session_done = 1;
+        g_hit_session_stop_reason = 2;
+        return 0;
+
+    case WUJI_CMD_HWBP_GET_HIT_STATUS: {
+        struct wuji_hwbp_hit_status status_reply;
+        if (payload_size < sizeof(status_reply)) {
+            return -EINVAL;
+        }
+        memset(&status_reply, 0, sizeof(status_reply));
+        status_reply.running = g_hit_session_running;
+        status_reply.done = g_hit_session_done;
+        status_reply.stop_reason = g_hit_session_stop_reason;
+        status_reply.requested_hits = g_hit_session_requested;
+        status_reply.remaining_hits = g_hit_session_remaining;
+        ret = compat_copy_payload_to_user(payload, &status_reply,
+                                          sizeof(status_reply));
+        if (ret) {
+            return ret;
+        }
+        return sizeof(status_reply);
+    }
+
+    case WUJI_CMD_HWBP_GET_STATE_SNAPSHOT:
+        return 0;
+
+    default:
+        pr_err("wuji-hwbp: unknown compat cmd=0x%x p1=0x%llx p2=0x%llx p3=0x%llx size=%llu\n",
+               (unsigned int)(unsigned char)req.cmd,
+               (unsigned long long)req.param1,
+               (unsigned long long)req.param2,
+               (unsigned long long)req.param3,
+               (unsigned long long)req.buf_size);
+        return -EINVAL;
+    }
+}
+
 static long prepare_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t len,
                                     char *__user out_msg, int outlen)
 {
@@ -1068,11 +1848,14 @@ static long status(char *__user out_msg, int outlen)
                       g_single_step_handler_addr ? 1 : 0;
 
     off += snprintf(reply + off, sizeof(reply) - off,
-                    "wuji-hwbp: mode=single-step slots=%d total_hits=%llu unknown_hits=%llu last_hit_pc=0x%llx last_hit_event=0x%llx step_starts=%llu step_completes=%llu step_failures=%llu step_symbols=%d step_hook=%d single_step_handler=0x%llx last_step=%d install_attempts=%llu install_failures=%llu uninstall_attempts=%llu uninstall_failures=%llu prepare_attempts=%llu prepare_failures=%llu symbols=%d resolver=%s last_resolve=%d last_prepare=%d worker_alive=%d worker_busy=%d pending=%d submit_seq=%llu done_seq=%llu last_worker=%d last_msg=%s\n",
+                    "wuji-hwbp: mode=single-step+wuji-proc slots=%d total_hits=%llu unknown_hits=%llu last_hit_pc=0x%llx last_hit_event=0x%llx hit_session=%u/%u remaining=%llu proc=%d step_starts=%llu step_completes=%llu step_failures=%llu step_symbols=%d step_hook=%d single_step_handler=0x%llx last_step=%d install_attempts=%llu install_failures=%llu uninstall_attempts=%llu uninstall_failures=%llu prepare_attempts=%llu prepare_failures=%llu symbols=%d resolver=%s last_resolve=%d last_prepare=%d worker_alive=%d worker_busy=%d pending=%d submit_seq=%llu done_seq=%llu last_worker=%d last_msg=%s\n",
                     WUJI_HWBP_MAX, (unsigned long long)g_total_hits,
                     (unsigned long long)g_unknown_hits,
                     (unsigned long long)g_last_hit_pc,
                     (unsigned long long)g_last_hit_event,
+                    g_hit_session_running, g_hit_session_done,
+                    (unsigned long long)g_hit_session_remaining,
+                    g_proc_file ? 1 : 0,
                     (unsigned long long)g_step_starts,
                     (unsigned long long)g_step_completes,
                     (unsigned long long)g_step_failures,
@@ -1104,11 +1887,13 @@ static long status(char *__user out_msg, int outlen)
         }
 
         off += snprintf(reply + off, sizeof(reply) - off,
-                        "slot=%d handle=0x%llx pid=%d addr=0x%llx len=%llu hits=%llu last_pc=0x%llx stepping=%d step_starts=%llu step_completes=%llu last_step_pc=0x%llx\n",
+                        "slot=%d handle=0x%llx pid=%d addr=0x%llx len=%llu type=%llu hits=%llu pending_hits=%u last_pc=0x%llx stepping=%d step_starts=%llu step_completes=%llu last_step_pc=0x%llx\n",
                         i, (unsigned long long)(uintptr_t)g_slots[i].event,
                         g_slots[i].pid, (unsigned long long)g_slots[i].addr,
                         (unsigned long long)g_slots[i].len,
+                        (unsigned long long)g_slots[i].type,
                         (unsigned long long)g_slots[i].hits,
+                        g_slots[i].hit_count,
                         (unsigned long long)g_slots[i].last_pc,
                         g_slots[i].stepping ? 1 : 0,
                         (unsigned long long)g_slots[i].step_starts,
@@ -1137,6 +1922,12 @@ static long wuji_hwbp_init(const char *args, const char *event, void *__user res
     g_unknown_hits = 0;
     g_last_hit_pc = 0;
     g_last_hit_event = 0;
+    g_hit_seq = 0;
+    g_hit_session_requested = 0;
+    g_hit_session_remaining = 0;
+    g_hit_session_running = 0;
+    g_hit_session_done = 0;
+    g_hit_session_stop_reason = 0;
     g_step_starts = 0;
     g_step_completes = 0;
     g_step_failures = 0;
@@ -1158,6 +1949,8 @@ static long wuji_hwbp_init(const char *args, const char *event, void *__user res
     g_req_addr = 0;
     g_req_len = 0;
     g_req_handle = 0;
+    g_proc_dir = NULL;
+    g_proc_file = NULL;
     g_worker_task = NULL;
     g_last_prepare_error = 0;
     g_last_worker_error = 0;
@@ -1169,7 +1962,13 @@ static long wuji_hwbp_init(const char *args, const char *event, void *__user res
         return 0;
     }
 
-    pr_info("wuji-hwbp: loaded async-worker\n");
+    ret = create_compat_proc();
+    if (ret) {
+        pr_err("wuji-hwbp: loaded without compat proc ret=%d\n", ret);
+    }
+
+    pr_info("wuji-hwbp: loaded async-worker compat-proc=%d\n",
+            g_proc_file ? 1 : 0);
     return 0;
 }
 
@@ -1248,6 +2047,7 @@ static long wuji_hwbp_exit(void *__user reserved)
     }
 
     remove_step_hook();
+    remove_compat_proc();
     pr_info("wuji-hwbp: unloaded idle\n");
     return 0;
 }
