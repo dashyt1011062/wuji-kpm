@@ -21,6 +21,7 @@ INCLUDE_DIRS := \
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/$(dir))
 
 CFLAGS += -Wall -Wextra -fno-builtin -fno-stack-protector -ffreestanding
+CFLAGS += -fno-pic -fno-pie
 CFLAGS += -nostdinc -mgeneral-regs-only -std=gnu11
 
 .PHONY: all clean

@@ -11,7 +11,6 @@
 #include <kputils.h>
 #include <linux/err.h>
 #include <linux/kernel.h>
-#include <linux/pid.h>
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <uapi/asm-generic/errno.h>
@@ -32,6 +31,7 @@
 
 struct perf_event;
 struct perf_sample_data;
+struct pid;
 struct task_struct;
 
 struct pt_regs {
@@ -111,10 +111,16 @@ struct perf_event_attr {
 typedef void (*perf_overflow_handler_t)(struct perf_event *event,
                                         struct perf_sample_data *data,
                                         struct pt_regs *regs);
+typedef unsigned long (*find_symbol_t)(const char *name);
 typedef struct perf_event *(*register_user_hw_breakpoint_t)(
     struct perf_event_attr *attr, perf_overflow_handler_t triggered,
     void *context, struct task_struct *task);
 typedef void (*unregister_hw_breakpoint_t)(struct perf_event *bp);
+typedef struct pid *(*find_get_pid_t)(int nr);
+typedef struct task_struct *(*pid_task_t)(struct pid *pid, int type);
+typedef struct task_struct *(*get_pid_task_t)(struct pid *pid, int type);
+typedef void (*put_pid_t)(struct pid *pid);
+typedef void (*put_task_struct_t)(struct task_struct *task);
 
 struct hwbp_slot {
     bool used;
@@ -134,10 +140,18 @@ KPM_DESCRIPTION("First-stage WuJi hardware execute breakpoint KPM.");
 
 static register_user_hw_breakpoint_t g_register_user_hw_breakpoint;
 static unregister_hw_breakpoint_t g_unregister_hw_breakpoint;
+static find_symbol_t g_find_symbol;
+static find_get_pid_t g_find_get_pid;
+static pid_task_t g_pid_task;
+static get_pid_task_t g_get_pid_task;
+static put_pid_t g_put_pid;
+static put_task_struct_t g_put_task_struct;
 static struct hwbp_slot g_slots[WUJI_HWBP_MAX];
 static uint64_t g_total_hits;
 static uint64_t g_install_attempts;
 static uint64_t g_install_failures;
+static int g_last_resolve_error;
+static const char *g_resolver_name = "none";
 
 static long copy_reply(char *__user out_msg, int outlen, const char *msg)
 {
@@ -159,26 +173,80 @@ static long copy_reply(char *__user out_msg, int outlen, const char *msg)
     return 0;
 }
 
-static int resolve_symbols(void)
+static unsigned long lookup_symbol(const char *name)
 {
-    if (g_register_user_hw_breakpoint && g_unregister_hw_breakpoint) {
+    unsigned long addr;
+
+    if (!name || !*name) {
         return 0;
     }
 
-    if (!kallsyms_lookup_name) {
+    /*
+     * SukiSU-Ultra exposes sukisu_compact_find_symbol(), whose address table
+     * also provides the KPM-facing "compact_find_symbol" alias.  Do not import
+     * ordinary kernel functions as KPM undefined symbols: the KPM loader only
+     * resolves its own exported KP symbols at relocation time.  Resolve normal
+     * kernel APIs lazily here instead.
+     */
+    if (!g_find_symbol) {
+        if (!kallsyms_lookup_name) {
+            g_resolver_name = "missing-kallsyms";
+            return 0;
+        }
+
+        g_find_symbol =
+            (find_symbol_t)kallsyms_lookup_name("sukisu_compact_find_symbol");
+        if (g_find_symbol) {
+            g_resolver_name = "sukisu_compact_find_symbol";
+        } else {
+            g_find_symbol = kallsyms_lookup_name;
+            g_resolver_name = "kallsyms_lookup_name";
+        }
+    }
+
+    addr = g_find_symbol(name);
+    if (!addr && g_find_symbol != kallsyms_lookup_name && kallsyms_lookup_name) {
+        addr = kallsyms_lookup_name(name);
+    }
+
+    return addr;
+}
+
+static int resolve_symbols(void)
+{
+    if (g_register_user_hw_breakpoint && g_unregister_hw_breakpoint &&
+        g_find_get_pid && g_put_pid &&
+        ((g_get_pid_task && g_put_task_struct) || g_pid_task)) {
+        return 0;
+    }
+
+    if (!lookup_symbol("sukisu_compact_find_symbol") && !kallsyms_lookup_name) {
+        g_last_resolve_error = -ENOSYS;
         return -ENOSYS;
     }
 
     g_register_user_hw_breakpoint =
-        (register_user_hw_breakpoint_t)kallsyms_lookup_name("register_user_hw_breakpoint");
+        (register_user_hw_breakpoint_t)lookup_symbol("register_user_hw_breakpoint");
     g_unregister_hw_breakpoint =
-        (unregister_hw_breakpoint_t)kallsyms_lookup_name("unregister_hw_breakpoint");
+        (unregister_hw_breakpoint_t)lookup_symbol("unregister_hw_breakpoint");
+    g_find_get_pid = (find_get_pid_t)lookup_symbol("find_get_pid");
+    g_get_pid_task = (get_pid_task_t)lookup_symbol("get_pid_task");
+    g_put_task_struct = (put_task_struct_t)lookup_symbol("put_task_struct");
+    g_pid_task = (pid_task_t)lookup_symbol("pid_task");
+    g_put_pid = (put_pid_t)lookup_symbol("put_pid");
 
-    if (!g_register_user_hw_breakpoint || !g_unregister_hw_breakpoint) {
-        pr_err("wuji-hwbp: required hw breakpoint symbols are missing\n");
-        return -ENOSYS;
+    if (!g_register_user_hw_breakpoint || !g_unregister_hw_breakpoint ||
+        !g_find_get_pid || !g_put_pid ||
+        !((g_get_pid_task && g_put_task_struct) || g_pid_task)) {
+        g_last_resolve_error = -ENOSYS;
+        pr_err("wuji-hwbp: required symbols missing resolver=%s hwbp=%px/%px pid=%px get_pid_task=%px put_task=%px pid_task=%px put_pid=%px\n",
+               g_resolver_name, g_register_user_hw_breakpoint,
+               g_unregister_hw_breakpoint, g_find_get_pid, g_get_pid_task,
+               g_put_task_struct, g_pid_task, g_put_pid);
+        return g_last_resolve_error;
     }
 
+    g_last_resolve_error = 0;
     return 0;
 }
 
@@ -274,6 +342,7 @@ static long install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t len,
     struct task_struct *task;
     int slot;
     int ret;
+    int task_ref = 0;
     char reply[192];
 
     if (pid <= 0 || !addr) {
@@ -294,14 +363,19 @@ static long install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t len,
         return copy_reply(out_msg, outlen, "error: no free hwbp slot\n");
     }
 
-    pid_ref = find_get_pid(pid);
+    pid_ref = g_find_get_pid(pid);
     if (!pid_ref) {
         return copy_reply(out_msg, outlen, "error: pid not found\n");
     }
 
-    task = pid_task(pid_ref, PIDTYPE_PID);
+    if (g_get_pid_task && g_put_task_struct) {
+        task = g_get_pid_task(pid_ref, 0);
+        task_ref = task ? 1 : 0;
+    } else {
+        task = g_pid_task(pid_ref, 0);
+    }
     if (!task) {
-        put_pid(pid_ref);
+        g_put_pid(pid_ref);
         return copy_reply(out_msg, outlen, "error: task not found\n");
     }
 
@@ -317,7 +391,10 @@ static long install_exec_breakpoint(pid_t pid, uint64_t addr, uint64_t len,
 
     g_install_attempts++;
     event = g_register_user_hw_breakpoint(&attr, wuji_hwbp_handler, NULL, task);
-    put_pid(pid_ref);
+    if (task_ref) {
+        g_put_task_struct(task);
+    }
+    g_put_pid(pid_ref);
 
     if (IS_ERR(event)) {
         ret = (int)PTR_ERR(event);
@@ -353,11 +430,14 @@ static long status(char *__user out_msg, int outlen)
     int i;
 
     off += snprintf(reply + off, sizeof(reply) - off,
-                    "wuji-hwbp: slots=%d total_hits=%llu install_attempts=%llu install_failures=%llu symbols=%d\n",
+                    "wuji-hwbp: slots=%d total_hits=%llu install_attempts=%llu install_failures=%llu symbols=%d resolver=%s last_resolve=%d\n",
                     WUJI_HWBP_MAX, (unsigned long long)g_total_hits,
                     (unsigned long long)g_install_attempts,
                     (unsigned long long)g_install_failures,
-                    g_register_user_hw_breakpoint && g_unregister_hw_breakpoint ? 1 : 0);
+                    g_register_user_hw_breakpoint && g_unregister_hw_breakpoint &&
+                        g_find_get_pid && g_put_pid &&
+                        ((g_get_pid_task && g_put_task_struct) || g_pid_task) ? 1 : 0,
+                    g_resolver_name, g_last_resolve_error);
 
     for (i = 0; i < WUJI_HWBP_MAX && off < (int)sizeof(reply); ++i) {
         if (!g_slots[i].used) {
@@ -373,6 +453,7 @@ static long status(char *__user out_msg, int outlen)
                         (unsigned long long)g_slots[i].last_pc);
     }
 
+    pr_info("wuji-hwbp: status: %s", reply);
     return copy_reply(out_msg, outlen, reply);
 }
 
