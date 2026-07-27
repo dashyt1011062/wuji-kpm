@@ -12,8 +12,10 @@
 #include <kputils.h>
 #include <linux/err.h>
 #include <linux/kernel.h>
+#include <linux/mm_types.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <pgtable.h>
 #include <uapi/asm-generic/errno.h>
 
 #define WUJI_HWBP_MAX 8
@@ -69,14 +71,15 @@
 #define WUJI_CMD_HWBP_GET_STATE_SNAPSHOT 0x6c
 #define WUJI_CMD_HWBP_CLEAR_STATE_SNAPSHOT 0x6d
 
-#define WUJI_FOLL_WRITE 0x01
-
 #define WUJI_READ_ONCE(x) (*(const volatile typeof(x) *)&(x))
 #define WUJI_WRITE_ONCE(x, val) \
     do { (*(volatile typeof(x) *)&(x)) = (val); } while (0)
 #ifndef UINT64_MAX
 #define UINT64_MAX (~0ULL)
 #endif
+
+#define WUJI_MEMREMAP_WB 0x00000001UL
+#define WUJI_PHYS_ADDR_BITS 48
 
 struct perf_event;
 struct perf_sample_data;
@@ -226,11 +229,11 @@ typedef unsigned long (*copy_from_user_t)(void *to,
 typedef unsigned long (*copy_to_user_t)(void __user *to,
                                         const void *from,
                                         unsigned long n);
-typedef int (*access_process_vm_t)(struct task_struct *tsk,
-                                   unsigned long addr,
-                                   void *buf,
-                                   int len,
-                                   unsigned int gup_flags);
+typedef void *(*memremap_t)(uint64_t offset, size_t size,
+                            unsigned long flags);
+typedef void (*memunmap_t)(void *addr);
+typedef struct mm_struct *(*get_task_mm_t)(struct task_struct *task);
+typedef void (*mmput_t)(struct mm_struct *mm);
 typedef struct proc_dir_entry *(*proc_mkdir_t)(const char *name,
                                                struct proc_dir_entry *parent);
 typedef struct proc_dir_entry *(*proc_create_t)(
@@ -337,7 +340,10 @@ static perf_event_disable_inatomic_t g_perf_event_disable_inatomic;
 static perf_event_enable_t g_perf_event_enable;
 static copy_from_user_t g_copy_from_user;
 static copy_to_user_t g_copy_to_user;
-static access_process_vm_t g_access_process_vm;
+static memremap_t g_memremap;
+static memunmap_t g_memunmap;
+static get_task_mm_t g_get_task_mm_fn;
+static mmput_t g_mmput_fn;
 static proc_mkdir_t g_proc_mkdir;
 static proc_create_t g_proc_create;
 static proc_remove_t g_proc_remove;
@@ -1294,9 +1300,9 @@ static int resolve_compat_proc_symbols(void)
     return 0;
 }
 
-static int resolve_compat_memory_symbols(void)
+static int resolve_compat_uaccess_symbols(void)
 {
-    if (g_copy_from_user && g_copy_to_user && g_access_process_vm) {
+    if (g_copy_from_user && g_copy_to_user) {
         return 0;
     }
 
@@ -1312,12 +1318,41 @@ static int resolve_compat_memory_symbols(void)
     if (!g_copy_to_user) {
         g_copy_to_user = (copy_to_user_t)lookup_symbol("copy_to_user");
     }
-    g_access_process_vm =
-        (access_process_vm_t)lookup_symbol("access_process_vm");
 
-    if (!g_copy_from_user || !g_copy_to_user || !g_access_process_vm) {
-        pr_err("wuji-hwbp: compat memory symbols missing copy_from_user=%px copy_to_user=%px access_process_vm=%px\n",
-               g_copy_from_user, g_copy_to_user, g_access_process_vm);
+    if (!g_copy_from_user || !g_copy_to_user) {
+        pr_err("wuji-hwbp: compat uaccess symbols missing copy_from_user=%px copy_to_user=%px\n",
+               g_copy_from_user, g_copy_to_user);
+        return -ENOSYS;
+    }
+
+    return 0;
+}
+
+static int resolve_compat_phys_symbols(void)
+{
+    int ret;
+
+    if (g_memremap && g_memunmap && g_get_task_mm_fn && g_mmput_fn) {
+        return 0;
+    }
+
+    ret = resolve_compat_uaccess_symbols();
+    if (ret) {
+        return ret;
+    }
+
+    if (!lookup_symbol("sukisu_compact_find_symbol") && !kallsyms_lookup_name) {
+        return -ENOSYS;
+    }
+
+    g_memremap = (memremap_t)lookup_symbol("memremap");
+    g_memunmap = (memunmap_t)lookup_symbol("memunmap");
+    g_get_task_mm_fn = (get_task_mm_t)lookup_symbol("get_task_mm");
+    g_mmput_fn = (mmput_t)lookup_symbol("mmput");
+
+    if (!g_memremap || !g_memunmap || !g_get_task_mm_fn || !g_mmput_fn) {
+        pr_err("wuji-hwbp: compat physical symbols missing memremap=%px memunmap=%px get_task_mm=%px mmput=%px\n",
+               g_memremap, g_memunmap, g_get_task_mm_fn, g_mmput_fn);
         return -ENOSYS;
     }
 
@@ -1333,7 +1368,7 @@ static int compat_copy_payload_to_user(void __user *to, const void *from,
     if (!size) {
         return 0;
     }
-    if (!g_copy_to_user && resolve_compat_memory_symbols()) {
+    if (!g_copy_to_user && resolve_compat_uaccess_symbols()) {
         return -ENOSYS;
     }
     return g_copy_to_user(to, from, size) ? -EFAULT : 0;
@@ -1418,11 +1453,197 @@ static struct task_struct *get_task_for_pid_ref(pid_t nr, int *task_ref,
     return task;
 }
 
+static uint64_t wuji_read_tcr_el1(void)
+{
+    uint64_t tcr;
+
+    asm volatile("mrs %0, tcr_el1" : "=r"(tcr));
+    return tcr;
+}
+
+static int wuji_page_shift_from_tcr(void)
+{
+    uint64_t tg0 = (wuji_read_tcr_el1() >> 14) & 0x3ULL;
+
+    switch (tg0) {
+    case 0:
+        return 12;
+    case 1:
+        return 16;
+    case 2:
+        return 14;
+    default:
+        return 0;
+    }
+}
+
+static int wuji_user_va_bits_from_tcr(void)
+{
+    uint64_t t0sz = wuji_read_tcr_el1() & 0x3fULL;
+
+    if (t0sz >= 64) {
+        return 0;
+    }
+
+    return 64 - (int)t0sz;
+}
+
+static uint64_t wuji_addr_mask_for_shift(int shift)
+{
+    return (((1ULL << (WUJI_PHYS_ADDR_BITS - shift)) - 1ULL) << shift);
+}
+
+static size_t wuji_min_size(size_t a, size_t b)
+{
+    return a < b ? a : b;
+}
+
+static int wuji_user_va_to_phys(uint64_t pgd, uint64_t va, uint64_t *out_phys,
+                                size_t *out_page_left)
+{
+    void *mapped_table = NULL;
+    uint64_t table_va = pgd;
+    uint64_t desc = 0;
+    uint64_t offset_mask;
+    int page_shift = wuji_page_shift_from_tcr();
+    int va_bits = wuji_user_va_bits_from_tcr();
+    int pxd_bits;
+    int page_level;
+    int start_level;
+    int lv;
+
+    if (!pgd || !out_phys || page_shift <= 0 || va_bits <= 0) {
+        return -EINVAL;
+    }
+
+    pxd_bits = page_shift - 3;
+    page_level = (va_bits - 4) / pxd_bits;
+    if (page_level <= 0 || page_level > 4) {
+        return -EINVAL;
+    }
+    start_level = 4 - page_level;
+
+    for (lv = start_level; lv < 4; ++lv) {
+        uint64_t pxd_shift = (uint64_t)pxd_bits * (uint64_t)(4 - lv) + 3ULL;
+        uint64_t pxd_ptrs = 1ULL << pxd_bits;
+        uint64_t pxd_index = (va >> pxd_shift) & (pxd_ptrs - 1ULL);
+        uint64_t *entry;
+        uint64_t type;
+
+        if (!table_va) {
+            if (mapped_table) {
+                g_memunmap(mapped_table);
+            }
+            return -EFAULT;
+        }
+
+        entry = (uint64_t *)(uintptr_t)table_va;
+        desc = WUJI_READ_ONCE(entry[pxd_index]);
+        type = desc & 0x3ULL;
+
+        if (type == 0x3ULL) {
+            uint64_t next_pa;
+
+            if (lv == 3) {
+                offset_mask = (1ULL << page_shift) - 1ULL;
+                *out_phys = (desc & wuji_addr_mask_for_shift(page_shift)) |
+                            (va & offset_mask);
+                if (out_page_left) {
+                    *out_page_left = (size_t)(offset_mask + 1ULL -
+                                             (va & offset_mask));
+                }
+                if (mapped_table) {
+                    g_memunmap(mapped_table);
+                }
+                return 0;
+            }
+
+            next_pa = desc & wuji_addr_mask_for_shift(page_shift);
+            if (mapped_table) {
+                g_memunmap(mapped_table);
+                mapped_table = NULL;
+            }
+            mapped_table = g_memremap(next_pa, (size_t)(1ULL << page_shift),
+                                      WUJI_MEMREMAP_WB);
+            if (!mapped_table) {
+                return -EFAULT;
+            }
+            table_va = (uint64_t)(uintptr_t)mapped_table;
+            continue;
+        }
+
+        if (type == 0x1ULL && lv < 3) {
+            int block_bits = (3 - lv) * pxd_bits + page_shift;
+            offset_mask = (1ULL << block_bits) - 1ULL;
+            *out_phys = (desc & wuji_addr_mask_for_shift(block_bits)) |
+                        (va & offset_mask);
+            if (out_page_left) {
+                uint64_t page_mask = (1ULL << page_shift) - 1ULL;
+                *out_page_left = (size_t)(page_mask + 1ULL -
+                                         (va & page_mask));
+            }
+            if (mapped_table) {
+                g_memunmap(mapped_table);
+            }
+            return 0;
+        }
+
+        if (mapped_table) {
+            g_memunmap(mapped_table);
+        }
+        return -EFAULT;
+    }
+
+    if (mapped_table) {
+        g_memunmap(mapped_table);
+    }
+    return -EFAULT;
+}
+
+static int wuji_copy_phys(uint64_t phys, void *buf, size_t size, int write)
+{
+    void *mapped;
+    uint64_t page_mask;
+    uint64_t page_base;
+    size_t page_off;
+    int page_shift = wuji_page_shift_from_tcr();
+
+    if (!buf || !size || page_shift <= 0) {
+        return -EINVAL;
+    }
+
+    page_mask = (1ULL << page_shift) - 1ULL;
+    page_base = phys & ~page_mask;
+    page_off = (size_t)(phys & page_mask);
+    if (page_off + size > (size_t)(1ULL << page_shift)) {
+        return -EINVAL;
+    }
+
+    mapped = g_memremap(page_base, (size_t)(1ULL << page_shift),
+                        WUJI_MEMREMAP_WB);
+    if (!mapped) {
+        return -EFAULT;
+    }
+
+    if (write) {
+        memcpy((char *)mapped + page_off, buf, size);
+        dsb(ishst);
+    } else {
+        memcpy(buf, (char *)mapped + page_off, size);
+    }
+
+    g_memunmap(mapped);
+    return 0;
+}
+
 static int compat_access_process(pid_t nr, uint64_t addr, void *buf,
                                  size_t size, int write)
 {
     struct pid *pid_ref = NULL;
     struct task_struct *task;
+    struct mm_struct *mm;
+    uint64_t pgd;
+    size_t done = 0;
     int task_ref = 0;
     int ret;
 
@@ -1431,9 +1652,14 @@ static int compat_access_process(pid_t nr, uint64_t addr, void *buf,
         return -EINVAL;
     }
 
-    ret = resolve_compat_memory_symbols();
+    ret = resolve_compat_phys_symbols();
     if (ret) {
         return ret;
+    }
+    if (mm_struct_offset.pgd_offset < 0) {
+        pr_err("wuji-hwbp: physical memory unavailable mm.pgd offset=%d\n",
+               mm_struct_offset.pgd_offset);
+        return -ENOSYS;
     }
 
     task = get_task_for_pid_ref(nr, &task_ref, &pid_ref);
@@ -1444,9 +1670,48 @@ static int compat_access_process(pid_t nr, uint64_t addr, void *buf,
         return -ESRCH;
     }
 
-    ret = g_access_process_vm(task, (unsigned long)addr, buf, (int)size,
-                              write ? WUJI_FOLL_WRITE : 0);
+    mm = g_get_task_mm_fn(task);
+    if (!mm || IS_ERR(mm)) {
+        ret = -ESRCH;
+        goto out_put_task;
+    }
 
+    pgd = WUJI_READ_ONCE(*(uint64_t *)((uintptr_t)mm +
+                                      (uintptr_t)mm_struct_offset.pgd_offset));
+    if (!pgd) {
+        ret = -EFAULT;
+        goto out_mmput;
+    }
+
+    while (done < size) {
+        uint64_t phys = 0;
+        size_t page_left = 0;
+        size_t chunk;
+
+        ret = wuji_user_va_to_phys(pgd, addr + done, &phys, &page_left);
+        if (ret) {
+            ret = done ? (int)done : ret;
+            goto out_mmput;
+        }
+        if (!page_left) {
+            ret = done ? (int)done : -EFAULT;
+            goto out_mmput;
+        }
+
+        chunk = wuji_min_size(size - done, page_left);
+        ret = wuji_copy_phys(phys, (char *)buf + done, chunk, write);
+        if (ret) {
+            ret = done ? (int)done : ret;
+            goto out_mmput;
+        }
+        done += chunk;
+    }
+
+    ret = (int)done;
+
+out_mmput:
+    g_mmput_fn(mm);
+out_put_task:
     if (task_ref) {
         g_put_task_struct(task);
     }
@@ -1546,7 +1811,7 @@ static ssize_t wuji_compat_proc_read(struct file *file, char __user *buf,
         return -EINVAL;
     }
 
-    ret = resolve_compat_memory_symbols();
+    ret = resolve_compat_uaccess_symbols();
     if (ret) {
         return ret;
     }
@@ -1839,6 +2104,9 @@ static long status(char *__user out_msg, int outlen)
     int i;
     int symbols_ok;
     int step_symbols_ok;
+    int phys_symbols_ok;
+    int phys_page_shift;
+    int phys_va_bits;
 
     symbols_ok = g_register_user_hw_breakpoint && g_unregister_hw_breakpoint &&
                  g_find_get_pid && g_put_pid &&
@@ -1846,9 +2114,14 @@ static long status(char *__user out_msg, int outlen)
     step_symbols_ok = g_user_enable_single_step && g_user_disable_single_step &&
                       g_perf_event_disable_inatomic && g_perf_event_enable &&
                       g_single_step_handler_addr ? 1 : 0;
+    phys_symbols_ok = g_memremap && g_memunmap && g_get_task_mm_fn &&
+                      g_mmput_fn && g_copy_from_user && g_copy_to_user &&
+                      mm_struct_offset.pgd_offset >= 0 ? 1 : 0;
+    phys_page_shift = wuji_page_shift_from_tcr();
+    phys_va_bits = wuji_user_va_bits_from_tcr();
 
     off += snprintf(reply + off, sizeof(reply) - off,
-                    "wuji-hwbp: mode=single-step+wuji-proc slots=%d total_hits=%llu unknown_hits=%llu last_hit_pc=0x%llx last_hit_event=0x%llx hit_session=%u/%u remaining=%llu proc=%d step_starts=%llu step_completes=%llu step_failures=%llu step_symbols=%d step_hook=%d single_step_handler=0x%llx last_step=%d install_attempts=%llu install_failures=%llu uninstall_attempts=%llu uninstall_failures=%llu prepare_attempts=%llu prepare_failures=%llu symbols=%d resolver=%s last_resolve=%d last_prepare=%d worker_alive=%d worker_busy=%d pending=%d submit_seq=%llu done_seq=%llu last_worker=%d last_msg=%s\n",
+                    "wuji-hwbp: mode=single-step+wuji-proc+phys-mem slots=%d total_hits=%llu unknown_hits=%llu last_hit_pc=0x%llx last_hit_event=0x%llx hit_session=%u/%u remaining=%llu proc=%d step_starts=%llu step_completes=%llu step_failures=%llu step_symbols=%d step_hook=%d single_step_handler=0x%llx phys_symbols=%d page_shift=%d va_bits=%d mm_pgd_off=%d last_step=%d install_attempts=%llu install_failures=%llu uninstall_attempts=%llu uninstall_failures=%llu prepare_attempts=%llu prepare_failures=%llu symbols=%d resolver=%s last_resolve=%d last_prepare=%d worker_alive=%d worker_busy=%d pending=%d submit_seq=%llu done_seq=%llu last_worker=%d last_msg=%s\n",
                     WUJI_HWBP_MAX, (unsigned long long)g_total_hits,
                     (unsigned long long)g_unknown_hits,
                     (unsigned long long)g_last_hit_pc,
@@ -1861,6 +2134,8 @@ static long status(char *__user out_msg, int outlen)
                     (unsigned long long)g_step_failures,
                     step_symbols_ok, g_step_hook_installed,
                     (unsigned long long)g_single_step_handler_addr,
+                    phys_symbols_ok, phys_page_shift, phys_va_bits,
+                    mm_struct_offset.pgd_offset,
                     g_last_step_error,
                     (unsigned long long)g_install_attempts,
                     (unsigned long long)g_install_failures,
@@ -1988,6 +2263,7 @@ static long wuji_hwbp_control(const char *args, char *__user out_msg, int outlen
     if (!strcmp(args, "status")) {
         (void)resolve_symbols();
         (void)resolve_step_symbols();
+        (void)resolve_compat_phys_symbols();
         return status(out_msg, outlen);
     }
 

@@ -19,7 +19,9 @@ It now includes a first-pass compatibility layer for binaries that speak the old
 /proc/9c7e1a3b5d0f2c8e4a6b1d9f3e7c0a2b/9c7e1a3b5d0f2c8e4a6b1d9f3e7c0a2b
 ```
 
-Implemented compatibility commands include open/close process, read/write process memory through `access_process_vm()`, read user instruction, install/uninstall execute or watchpoint hardware breakpoints, hit count/detail/detail-ex, clear hit ring, and basic hit-session status. State snapshot commands currently return zero items; the AYCPU side reads `/proc/<pid>/maps` directly instead of asking the KPM to build a maps list.
+Implemented compatibility commands include open/close process, read/write process memory through direct physical page-table translation, read user instruction, install/uninstall execute or watchpoint hardware breakpoints, hit count/detail/detail-ex, clear hit ring, and basic hit-session status. State snapshot commands currently return zero items; the AYCPU side reads `/proc/<pid>/maps` directly instead of asking the KPM to build a maps list.
+
+The WuJi read/write commands no longer call or fall back to `access_process_vm()`. They resolve the target task's `mm`, read `mm->pgd` through KPatch's `mm_struct_offset`, translate the requested user virtual address to the currently mapped physical page, and copy through `memremap(MEMREMAP_WB)`. This means non-present/swapped pages fail instead of being faulted in, and writes modify the physical page currently referenced by the PTE rather than triggering normal COW/user fault behavior.
 
 ## Safety note
 
