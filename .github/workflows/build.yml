@@ -1,0 +1,52 @@
+name: Build wuji-hwbp KPM
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build.yml"
+      - "Makefile"
+      - "src/**"
+      - "README.md"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out wuji-kpm
+        uses: actions/checkout@v4
+        with:
+          path: wuji-kpm
+
+      - name: Check out KPatch-Next
+        uses: actions/checkout@v4
+        with:
+          repository: dashyt1011062/KPatch-Next
+          ref: main
+          path: kpatch-next
+          fetch-depth: 1
+
+      - name: Install aarch64-none-elf toolchain
+        run: |
+          curl -fL --retry 3 -o arm-gnu-toolchain.tar.xz https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -Jxf arm-gnu-toolchain.tar.xz
+
+      - name: Build KPM
+        run: |
+          export TARGET_COMPILE="$GITHUB_WORKSPACE/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+          make -C wuji-kpm KP_DIR="$GITHUB_WORKSPACE/kpatch-next" clean
+          make -C wuji-kpm KP_DIR="$GITHUB_WORKSPACE/kpatch-next"
+          mkdir -p artifacts
+          cp wuji-kpm/wuji-hwbp.kpm artifacts/
+          file artifacts/wuji-hwbp.kpm
+
+      - name: Upload KPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wuji-hwbp-kpm-${{ github.run_number }}
+          path: artifacts/wuji-hwbp.kpm
+          if-no-files-found: error

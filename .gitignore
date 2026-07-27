@@ -1,0 +1,6 @@
+*.o
+*.kpm
+kpatch-next/
+arm-gnu-toolchain-*/
+arm-gnu-toolchain*.tar.xz
+artifacts/
